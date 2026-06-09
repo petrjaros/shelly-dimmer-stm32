@@ -1,18 +1,18 @@
-/* 
+/*
  * This file is part of the shelly-dimmer-stm32 project.
  * https://github.com/jamesturton/shelly-dimmer-stm32
  * Copyright (c) 2020 James Turton.
- * 
- * This program is free software: you can redistribute it and/or modify  
- * it under the terms of the GNU General Public License as published by  
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, version 3.
  *
- * This program is distributed in the hope that it will be useful, but 
- * WITHOUT ANY WARRANTY; without even the implied warranty of 
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
  * General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License 
+ * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
@@ -29,7 +29,7 @@
 #include <libopencm3/cm3/systick.h>
 
 #define SHD_DRIVER_MAJOR_VERSION            51
-#define SHD_DRIVER_MINOR_VERSION            7
+#define SHD_DRIVER_MINOR_VERSION            4
 
 #define SHD_SWITCH_CMD                      0x01
 #define SHD_SWITCH_FADE_CMD                 0x02
@@ -76,7 +76,7 @@ static uint8_t  id                          = 0;
 static uint8_t  cmd                         = 0;
 
 static uint32_t systick_ms                  = 0;
-static uint32_t line_freq                   = 1000 * 64; // Guess we are at 50 Hz (x 64 for enhanced precision in IIR filter)
+static uint32_t line_freq                   = 1000 * 60; // Guess we are at 50 Hz (x 60 for enhanced precision in IIR filter)
 static uint32_t line_freq_counter           = 1000; // Guess we are at 50 Hz
 
 static uint32_t tim_ccr1_now                = 0;
@@ -130,6 +130,10 @@ static uint16_t max_brightness              = 500;
 #else
 static uint16_t max_brightness              = 1000;
 #endif
+
+static bool is_flickering = false;
+static uint8_t period_index = 0;
+static bool is_flickering_array[3] = {false};
 
 static void ring_init(struct ring *ring, uint8_t *buf, ring_size_t size)
 {
@@ -204,7 +208,7 @@ static int check_byte(uint8_t *buf, uint8_t index)
 
     if ((index == (4 + data_length + 2)) && (byte == SHD_END_BYTE))
         return index;   // Check end byte is valid
-    
+
     return 0;
 }
 
@@ -218,7 +222,7 @@ static void packet_process(uint8_t *buf)
     len = buf[pos++];
 
     (void)len;  // We don't use the packet length here, but maybe in the future
-    
+
     switch (cmd)
     {
         case SHD_SWITCH_CMD:
@@ -258,7 +262,7 @@ static void generate_packet(uint8_t len, uint8_t *payload)
     }
 
     // Calculate checksum from id and onwards
-    chksm = checksum(data + 1, 3 + len); 
+    chksm = checksum(data + 1, 3 + len);
     data[pos++] = chksm >> 8;
     data[pos++] = chksm & 0xff;
     data[pos++] = SHD_END_BYTE;
@@ -370,7 +374,7 @@ static void generate_reply(void)
             data[0] = 0x01;
         }
         break;
-    
+
     case SHD_VERSION_CMD:
         {
             len = 2;
@@ -414,7 +418,7 @@ static bool read_serial(uint8_t *buf, uint8_t *index)
 {
     uint8_t serial_in_byte = usart_recv(USART1);
     buf[*index] = serial_in_byte;
-    
+
     int check = check_byte(buf, *index);
 
     if (check > 1)
@@ -635,7 +639,7 @@ static void timer2_setup(void)
     timer_enable_oc_output(TIM2, TIM_OC1);
     timer_ic_enable(TIM2, TIM_IC1);
     timer_enable_irq(TIM2, TIM_DIER_CC1IE);
-    
+
     // Setup channel 2, PA1
     timer_ic_set_input(TIM2, TIM_IC2, TIM_IC_IN_TI2);
     timer_ic_set_filter(TIM2, TIM_IC2, TIM_IC_CK_INT_N_2);
@@ -777,24 +781,34 @@ static void mosfet_off(void) {
 
 static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
 {
+    uint16_t cntr = timer_get_counter(TIM1);
+    uint16_t period = 0;
+    timer_set_counter(TIM1, 0);
+    bool is_rising = gpio_get(gpio_bank, gpio_pin);
     // Have we triggered too early? If so return straight away
-    if (timer_get_counter(TIM1) < 750)
+    if (cntr < 750)
         return;
 
-    if (gpio_get(gpio_bank, gpio_pin))
-        line_freq_counter = timer_get_counter(TIM1);
+    if (is_rising) {
+        period = line_freq_counter + cntr;
+        period_index = (period_index + 1) % 3;
+        is_flickering_array[period_index] = period > (line_freq / 30 + 7) || period < (line_freq / 30 - 7);
+        is_flickering = is_flickering_array[0] || is_flickering_array[1] || is_flickering_array[2];
+
+        line_freq = line_freq - line_freq / 30 + period;
+    }
     else
     {
-        line_freq_counter = (line_freq_counter + timer_get_counter(TIM1)) / 2;
-        line_freq = line_freq - line_freq / 64 + line_freq_counter;
+        line_freq_counter = cntr;
     }
 
     // Change ouput polarity if needed depending on leading edge mode
     brightness = brightness_req * max_brightness / 1000;
+    brightness = is_flickering ? 0 : brightness;
     brightness = leading_edge ? 1000 - brightness : brightness;
 
     // Adjust the brigtness value according to the mains frequency
-    brightness_adj = brightness * line_freq / 64000;
+    brightness_adj = brightness * line_freq / 60000;
     if (brightness_adj < low_brightness_threshold)
     {
         timer_set_oc_value(TIM1, TIM_OC1, low_brightness_threshold);
@@ -806,7 +820,6 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
         timer_set_oc_value(TIM1, TIM_OC2, 0);
         mosfet_on();
     }
-    timer_set_counter(TIM1, 0);
 
     // Do the rest after setting up the timer, as this may cause jitter
 
