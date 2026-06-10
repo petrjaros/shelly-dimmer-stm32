@@ -28,8 +28,8 @@
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/cm3/systick.h>
 
-#define SHD_DRIVER_MAJOR_VERSION            51
-#define SHD_DRIVER_MINOR_VERSION            4
+#define SHD_DRIVER_MAJOR_VERSION            52
+#define SHD_DRIVER_MINOR_VERSION            1
 
 #define SHD_SWITCH_CMD                      0x01
 #define SHD_SWITCH_FADE_CMD                 0x02
@@ -779,18 +779,33 @@ static void mosfet_off(void) {
     }
 }
 
+static void apply_brightness_at(uint32_t base, uint32_t t_dim)
+{
+    if (t_dim < low_brightness_threshold)
+    {
+        timer_set_oc_value(TIM1, TIM_OC1, base + low_brightness_threshold);
+        timer_set_oc_value(TIM1, TIM_OC2, base + low_brightness_threshold - t_dim);
+    }
+    else if (t_dim > 0)
+    {
+        timer_set_oc_value(TIM1, TIM_OC1, base + t_dim);
+        timer_set_oc_value(TIM1, TIM_OC2, base);
+        mosfet_on();
+    }
+}
+
 static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
 {
-    uint16_t cntr = timer_get_counter(TIM1);
+    uint16_t tim1_now = timer_get_counter(TIM1);
     uint16_t period = 0;
     timer_set_counter(TIM1, 0);
     bool is_rising = gpio_get(gpio_bank, gpio_pin);
     // Have we triggered too early? If so return straight away
-    if (cntr < 750)
+    if (tim1_now < 750)
         return;
 
     if (is_rising) {
-        period = line_freq_counter + cntr;
+        period = line_freq_counter + tim1_now;
         period_index = (period_index + 1) % 3;
         is_flickering_array[period_index] = period > (line_freq / 30 + 7) || period < (line_freq / 30 - 7);
         is_flickering = is_flickering_array[0] || is_flickering_array[1] || is_flickering_array[2];
@@ -799,27 +814,19 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
     }
     else
     {
-        line_freq_counter = cntr;
+        line_freq_counter = tim1_now;
     }
 
     // Change ouput polarity if needed depending on leading edge mode
     brightness = brightness_req * max_brightness / 1000;
-    brightness = is_flickering ? 0 : brightness;
     brightness = leading_edge ? 1000 - brightness : brightness;
 
     // Adjust the brigtness value according to the mains frequency
     brightness_adj = brightness * line_freq / 60000;
-    if (brightness_adj < low_brightness_threshold)
-    {
-        timer_set_oc_value(TIM1, TIM_OC1, low_brightness_threshold);
-        timer_set_oc_value(TIM1, TIM_OC2, low_brightness_threshold - brightness_adj);
-    }
-    else if (brightness_adj > 0)
-    {
-        timer_set_oc_value(TIM1, TIM_OC1, brightness_adj);
-        timer_set_oc_value(TIM1, TIM_OC2, 0);
-        mosfet_on();
-    }
+
+    uint32_t bright_first  = brightness_adj;
+
+    apply_brightness_at(0, bright_first);
 
     // Do the rest after setting up the timer, as this may cause jitter
 
