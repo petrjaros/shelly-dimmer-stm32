@@ -76,8 +76,8 @@ static uint8_t  id                          = 0;
 static uint8_t  cmd                         = 0;
 
 static uint32_t systick_ms                  = 0;
-static uint32_t line_freq                   = 1000 * 60; // Guess we are at 50 Hz (x 60 for enhanced precision in IIR filter)
-static uint32_t line_freq_counter           = 1000; // Guess we are at 50 Hz
+static uint32_t line_freq                   = 10000 * 60; // Guess we are at 50 Hz (x 60 for enhanced precision in IIR filter, 1 us ticks)
+static uint32_t line_freq_counter           = 10000; // Guess we are at 50 Hz (1 us ticks)
 
 static uint32_t tim_ccr1_now                = 0;
 static uint32_t tim_ccr1_last               = 0;
@@ -108,6 +108,13 @@ static uint32_t brightness_adj              = 0;
 
 static bool     leading_edge                = false;
 static uint32_t low_brightness_threshold    = 0; // switch on the mosfets later for low brightness (default to 0)
+
+// Per-half-cycle start offset used to compensate for the asymmetric duty
+// cycle of the zero-cross detector, so both mains half-cycles conduct an
+// equal window (kills the steady low-brightness flicker). See on_trigger().
+static uint32_t base_rising                 = 0;
+static uint32_t base_falling                = 0;
+static int32_t  corr_acc                     = 0; // low-pass accumulator (x8)
 
 static uint16_t adc_data[ADC_NUM_CHANNELS]  = {0};
 static uint8_t  adc_channels[ADC_NUM_CHANNELS] =
@@ -233,7 +240,9 @@ static void packet_process(uint8_t *buf)
         case SHD_SETTINGS_CMD:
             {
                 leading_edge = 2 - buf[pos + 2];
-                low_brightness_threshold = buf[pos + 7] << 8 | buf[pos + 6]; // this is warmup_brightness
+                // warmup_brightness, scaled to 1 us timer ticks (x10 vs the
+                // old 10 us ticks) so it stays in the same units as t_dim.
+                low_brightness_threshold = (buf[pos + 7] << 8 | buf[pos + 6]) * 10;
             }
             break;
         default:
@@ -585,14 +594,21 @@ static void timer1_setup(void)
     timer_disable_counter(TIM1);
     rcc_periph_reset_pulse(RST_TIM1);
 
-    // Enable timer 1 interupt
+    // Enable timer 1 interupt at the highest priority: it switches the
+    // output MOSFETs, so any delay here directly jitters the on-time and
+    // shows up as flicker (worst at low brightness, where the on-time is
+    // tiny). It must be able to preempt the measurement interrupts.
+    nvic_set_priority(NVIC_TIM1_CC_IRQ, 0x00);
     nvic_enable_irq(NVIC_TIM1_CC_IRQ);
 
     // Initialise timer 1 as up counting on clock edge
     timer_set_mode(TIM1, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
 
-    // Divide systick clock down to 100 kHz
-    timer_set_prescaler(TIM1, 480);
+    // Divide timer clock down to 1 MHz (1 us/tick). The finer resolution lets
+    // the half-cycle symmetry correction land within a microsecond instead of
+    // being quantised to 10 us, which is what removes the last low-brightness
+    // shimmer. Period 65535 still covers a full 10 ms half-cycle 6x over.
+    timer_set_prescaler(TIM1, 48);
 
     // Only needed for advanced timers:
     // timer_set_repetition_counter(TIM1, 0);
@@ -616,7 +632,9 @@ static void timer2_setup(void)
     timer_disable_counter(TIM2);
     rcc_periph_reset_pulse(RST_TIM2);
 
-    // Enable timer 2 interupt
+    // Enable timer 2 interupt at a low priority: this only does power/voltage
+    // metering, which can tolerate being preempted by the dimming interrupts.
+    nvic_set_priority(NVIC_TIM2_IRQ, 0xC0);
     nvic_enable_irq(NVIC_TIM2_IRQ);
 
     // Initialise timer 2 as up counting on clock edge
@@ -663,7 +681,11 @@ static void timer3_setup(void)
     timer_disable_counter(TIM3);
     rcc_periph_reset_pulse(RST_TIM3);
 
-    // Enable timer 3 interupt
+    // Enable timer 3 interupt at a low priority: this fires at 10 kHz to
+    // accumulate ADC samples for metering. It is the most frequent interrupt,
+    // so leaving it able to block the dimming interrupts is the main source of
+    // switch-timing jitter; keep it below TIM1_CC and EXTI.
+    nvic_set_priority(NVIC_TIM3_IRQ, 0xC0);
     nvic_enable_irq(NVIC_TIM3_IRQ);
 
     // Initialise timer 3 as up counting on clock edge
@@ -688,7 +710,12 @@ static void timer3_setup(void)
 
 static void exti_setup(void)
 {
-    // Enable external interrupts 2 and 7
+    // Enable external interrupts 2 and 7 at a high priority: these mark the
+    // mains zero-crossing and reset TIM1, so they set the phase reference for
+    // the whole half-cycle. They must preempt the measurement interrupts so
+    // the reference is not delayed, but sit just below TIM1_CC switching.
+    nvic_set_priority(NVIC_EXTI2_3_IRQ, 0x40);
+    nvic_set_priority(NVIC_EXTI4_15_IRQ, 0x40);
     nvic_enable_irq(NVIC_EXTI2_3_IRQ);
     nvic_enable_irq(NVIC_EXTI4_15_IRQ);
 
@@ -790,7 +817,12 @@ static void apply_brightness_at(uint32_t base, uint32_t t_dim)
     {
         timer_set_oc_value(TIM1, TIM_OC1, base + t_dim);
         timer_set_oc_value(TIM1, TIM_OC2, base);
-        mosfet_on();
+        // With base == 0 the OC2 compare matches at counter 0, which we have
+        // just reset past, so switch on directly. With base > 0 the OC2
+        // compare at counter == base turns it on instead - switching at base
+        // rather than at 0 is exactly what keeps the two half-cycles symmetric.
+        if (base == 0)
+            mosfet_on();
     }
 }
 
@@ -801,7 +833,7 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
     timer_set_counter(TIM1, 0);
     bool is_rising = gpio_get(gpio_bank, gpio_pin);
     // Have we triggered too early? If so return straight away
-    if (tim1_now < 750)
+    if (tim1_now < 7500)
         return;
 
     if (is_rising) {
@@ -811,6 +843,41 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
         is_flickering = is_flickering_array[0] || is_flickering_array[1] || is_flickering_array[2];
 
         line_freq = line_freq - line_freq / 30 + period;
+
+        // The zero-cross detector is not an exact 50% duty signal: its rising
+        // and falling edges sit at different offsets from the true mains zero
+        // crossings (line_freq_counter is the high duration, tim1_now the low
+        // duration). Conducting the same on-time from each edge then delivers
+        // unequal energy to the two half-cycles - a steady 50 Hz shimmer that
+        // is only visible at low brightness, where the on-time is tiny. Delay
+        // the earlier half-cycle by half the difference so both conduct at the
+        // same offset from their zero crossing.
+        int32_t target = ((int32_t)line_freq_counter - (int32_t)tim1_now) / 2;
+        // Clamp so a missed/glitched edge can't shove the window into the
+        // half-cycle or poison the filter below.
+        if (target > 2000)
+            target = 2000;
+        else if (target < -2000)
+            target = -2000;
+
+        // Low-pass the correction (~8-cycle time constant). The raw per-cycle
+        // difference jitters by a tick or two from mains jitter and timer
+        // quantisation; feeding that straight into the window position would
+        // itself shimmer. Smoothing leaves a stable offset that still tracks
+        // slow drift.
+        corr_acc = corr_acc - corr_acc / 8 + target;
+        int32_t corr = corr_acc / 8;
+
+        if (corr >= 0)
+        {
+            base_rising = corr;
+            base_falling = 0;
+        }
+        else
+        {
+            base_rising = 0;
+            base_falling = -corr;
+        }
     }
     else
     {
@@ -824,9 +891,7 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
     // Adjust the brigtness value according to the mains frequency
     brightness_adj = brightness * line_freq / 60000;
 
-    uint32_t bright_first  = brightness_adj;
-
-    apply_brightness_at(0, bright_first);
+    apply_brightness_at(is_rising ? base_rising : base_falling, brightness_adj);
 
     // Do the rest after setting up the timer, as this may cause jitter
 
