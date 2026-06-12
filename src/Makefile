@@ -1,9 +1,12 @@
 PROJECT = shelly-dimmer-stm32
 BUILD_DIR = bin
 
-CFILES = main.c
+CFILES = main.c dimcomp.c
 
 BINARY = usart
+
+# dimcomp.c pulls in sinf/cosf/fmodf from the math library.
+LDLIBS += -lm
 
 # TODO - you will need to edit these two lines!
 DEVICE=stm32f031k6

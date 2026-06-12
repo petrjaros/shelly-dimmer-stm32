@@ -28,6 +28,8 @@
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/cm3/systick.h>
 
+#include "dimcomp.h"
+
 #define SHD_DRIVER_MAJOR_VERSION            52
 #define SHD_DRIVER_MINOR_VERSION            1
 
@@ -104,7 +106,11 @@ static hw_types hw_version                  = dimmer2;
 
 static uint16_t brightness                  = 0;
 static uint16_t brightness_req              = 0;
-static uint32_t brightness_adj              = 0;
+// Written by the zero-cross ISR (on_trigger) and polled by the idle loop to
+// resync dimcomp's coefficients, so it must be volatile: without it the
+// compiler hoists the read out of the idle loop and collapses it to a dead
+// self-spin, leaving dimcomp permanently uncompensated.
+static volatile uint32_t brightness_adj    = 0;
 
 static bool     leading_edge                = false;
 static uint32_t low_brightness_threshold    = 0; // switch on the mosfets later for low brightness (default to 0)
@@ -141,6 +147,14 @@ static uint16_t max_brightness              = 1000;
 static bool is_flickering = false;
 static uint8_t period_index = 0;
 static bool is_flickering_array[3] = {false};
+
+// Per-cycle PLC-signal flicker compensation (see dimcomp.c). Only engaged
+// while is_flickering is true. n_half is the nominal timer ticks per mains
+// half-cycle (1 us/tick): 10 ms for the assumed 50 Hz mains.
+#define DIMCOMP_N_HALF              10000
+static dimcomp_t dimcomp;
+static uint32_t  dimcomp_ts        = 0; // free-running full-cycle timestamp (ticks)
+static int32_t   dimcomp_dt_second = 0; // 2nd half-cycle correction, applied on the falling edge
 
 static void ring_init(struct ring *ring, uint8_t *buf, ring_size_t size)
 {
@@ -808,38 +822,116 @@ static void mosfet_off(void) {
 
 static void apply_brightness_at(uint32_t base, uint32_t t_dim)
 {
+    uint32_t on_val, off_val;
+
     if (t_dim < low_brightness_threshold)
     {
-        timer_set_oc_value(TIM1, TIM_OC1, base + low_brightness_threshold);
-        timer_set_oc_value(TIM1, TIM_OC2, base + low_brightness_threshold - t_dim);
+        off_val = base + low_brightness_threshold;
+        on_val  = base + low_brightness_threshold - t_dim;
     }
     else if (t_dim > 0)
     {
-        timer_set_oc_value(TIM1, TIM_OC1, base + t_dim);
-        timer_set_oc_value(TIM1, TIM_OC2, base);
-        // With base == 0 the OC2 compare matches at counter 0, which we have
-        // just reset past, so switch on directly. With base > 0 the OC2
-        // compare at counter == base turns it on instead - switching at base
-        // rather than at 0 is exactly what keeps the two half-cycles symmetric.
-        if (base == 0)
-            mosfet_on();
+        off_val = base + t_dim;
+        on_val  = base;
     }
+    else
+    {
+        return;     // brightness 0 - leave the MOSFETs off
+    }
+
+    timer_set_oc_value(TIM1, TIM_OC1, off_val);
+    timer_set_oc_value(TIM1, TIM_OC2, on_val);
+
+    // The OC2 compare turns the MOSFETs on at counter == on_val. But this runs
+    // late in on_trigger: the counter was reset at the zero crossing and then a
+    // chunk of work ran before we get here - notably the rising edge does
+    // several software divisions (no HW divider on M0), ~15-20 us, vs ~7 us on
+    // the falling edge. If on_val is smaller than that elapsed time, the
+    // compare value is already in the past, CC2 never fires, and the half-cycle
+    // stays dark - and because the two edges have different latency, the two
+    // half-cycles go dark unequally, which is a steady 50 Hz flicker at low
+    // brightness (where on_val/base is tiny). Switch on directly if we have
+    // already passed on_val. This also covers on_val == 0, where the compare
+    // can never match after the counter reset.
+    if (timer_get_counter(TIM1) >= on_val)
+        mosfet_on();
 }
 
 static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
 {
     uint16_t tim1_now = timer_get_counter(TIM1);
-    uint16_t period = 0;
     timer_set_counter(TIM1, 0);
     bool is_rising = gpio_get(gpio_bank, gpio_pin);
     // Have we triggered too early? If so return straight away
     if (tim1_now < 7500)
         return;
 
-    if (is_rising) {
-        period = line_freq_counter + tim1_now;
+    // Full-cycle period (high duration from the last falling edge + the
+    // duration since). Only meaningful on the rising edge; computed here so it
+    // is available before the bookkeeping that consumes it.
+    uint32_t period = line_freq_counter + tim1_now;
+
+    // ---- Program the dimmer FIRST, before the per-cycle bookkeeping below. ----
+    // That bookkeeping - especially the rising edge's line_freq / corr /
+    // is_flickering work - is several software divisions on the divider-less M0
+    // (~20 us) and differs between the two edges. Running it before the timer
+    // was programmed delayed the turn-on compare unequally for the two
+    // half-cycles, which at low brightness missed small compare values and
+    // darkened one half - a steady 50 Hz imbalance. We program from values
+    // carried over from the previous cycle (base_rising/base_falling, and
+    // line_freq for brightness_adj); both drift far less than a tick per cycle,
+    // so using them one cycle early is invisible, while the turn-on now lands
+    // with minimal, matched latency on both edges.
+
+    // Change ouput polarity if needed depending on leading edge mode
+    brightness = brightness_req * max_brightness / 1000;
+    brightness = leading_edge ? 1000 - brightness : brightness;
+
+    // Adjust the brigtness value according to the mains frequency
+    brightness_adj = brightness * line_freq / 60000;
+
+    // While a flicker-inducing data signal rides on the mains, fold in the
+    // per-half-cycle dimcomp correction. dimcomp_on_zc runs once per full
+    // cycle (on the rising edge) and yields a correction for both the first
+    // half-cycle (its return value) and the second (t_dim_second), each as a
+    // small delta around its own nominal. We apply those deltas on top of the
+    // live brightness_adj so brightness tracking stays exact. dimcomp's own
+    // signal detector returns the nominal (zero delta) when it sees no signal,
+    // so this is safe even if is_flickering is a false positive.
+    uint32_t t_dim = brightness_adj;
+    if (is_flickering)
+    {
+        int32_t dt;
+        if (is_rising)
+        {
+            // dimcomp only needs the inter-call delta; advancing our own
+            // accumulator by the measured full-cycle period keeps T_n correct
+            // even across cycles where compensation was disabled.
+            dimcomp_ts += period;
+            uint16_t t1 = dimcomp_on_zc(&dimcomp, dimcomp_ts);
+            dt = (int32_t)t1 - (int32_t)dimcomp.t_dim_nominal;
+            dimcomp_dt_second = (int32_t)dimcomp.t_dim_second -
+                                (int32_t)dimcomp.t_dim_nominal;
+        }
+        else
+        {
+            dt = dimcomp_dt_second;
+        }
+
+        int32_t t = (int32_t)brightness_adj + dt;
+        if (t < 0)                t = 0;
+        if (t > DIMCOMP_N_HALF)   t = DIMCOMP_N_HALF;
+        t_dim = (uint32_t)t;
+    }
+
+    apply_brightness_at(is_rising ? base_rising : base_falling, t_dim);
+
+    // ---- Per-cycle bookkeeping. Runs after the timer is programmed so its
+    // latency (and any jitter) no longer shifts the switching instants. ----
+    if (is_rising)
+    {
         period_index = (period_index + 1) % 3;
-        is_flickering_array[period_index] = period > (line_freq / 30 + 7) || period < (line_freq / 30 - 7);
+        is_flickering_array[period_index] = period > (line_freq / 30 + 70) || period < (line_freq / 30 - 70);
         is_flickering = is_flickering_array[0] || is_flickering_array[1] || is_flickering_array[2];
 
         line_freq = line_freq - line_freq / 30 + period;
@@ -851,7 +943,7 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
         // unequal energy to the two half-cycles - a steady 50 Hz shimmer that
         // is only visible at low brightness, where the on-time is tiny. Delay
         // the earlier half-cycle by half the difference so both conduct at the
-        // same offset from their zero crossing.
+        // same offset from their zero crossing. Applied from the next cycle on.
         int32_t target = ((int32_t)line_freq_counter - (int32_t)tim1_now) / 2;
         // Clamp so a missed/glitched edge can't shove the window into the
         // half-cycle or poison the filter below.
@@ -878,26 +970,8 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
             base_rising = 0;
             base_falling = -corr;
         }
-    }
-    else
-    {
-        line_freq_counter = tim1_now;
-    }
 
-    // Change ouput polarity if needed depending on leading edge mode
-    brightness = brightness_req * max_brightness / 1000;
-    brightness = leading_edge ? 1000 - brightness : brightness;
-
-    // Adjust the brigtness value according to the mains frequency
-    brightness_adj = brightness * line_freq / 60000;
-
-    apply_brightness_at(is_rising ? base_rising : base_falling, brightness_adj);
-
-    // Do the rest after setting up the timer, as this may cause jitter
-
-    // Update only once per full line cycle
-    if (gpio_get(gpio_bank, gpio_pin))
-    {
+        // Metering: update once per full line cycle.
         current_max_period = current_total / adc_count;
         current_total = 0;
         current_total_mag_period = current_total_mag / adc_count;
@@ -905,6 +979,10 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
         voltage_max_period = voltage_total / adc_count;
         voltage_total = 0;
         adc_count = 0;
+    }
+    else
+    {
+        line_freq_counter = tim1_now;
     }
 }
 
@@ -931,9 +1009,23 @@ int main(void)
     // Setup systick for general timekeeping
     systick_setup();
 
+    // Setup the per-cycle flicker compensation model.
+    dimcomp_init(&dimcomp, DIMCOMP_N_HALF);
+
     // Keep doing this forever
     while (1)
-        __asm__("nop");
+    {
+        // dimcomp_set_brightness uses sinf/cosf to recompute the correction
+        // coefficients and must therefore stay out of the switching ISR. Run
+        // it here in the idle loop whenever the live dim time has moved enough
+        // to matter (a small deadband ignores per-cycle mains jitter). The
+        // ISR keeps tracking exact brightness via brightness_adj regardless,
+        // so a few ticks of lag in the coefficients is harmless.
+        int32_t diff = (int32_t)brightness_adj - (int32_t)dimcomp.t_dim_nominal;
+        if (diff < 0) diff = -diff;
+        if (diff > 4)
+            dimcomp_set_brightness(&dimcomp, (uint16_t)brightness_adj);
+    }
 
     return 0;
 }
