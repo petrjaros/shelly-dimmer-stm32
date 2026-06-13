@@ -78,7 +78,10 @@ static uint8_t  id                          = 0;
 static uint8_t  cmd                         = 0;
 
 static uint32_t systick_ms                  = 0;
-static uint32_t line_freq                   = 10000 * 60; // Guess we are at 50 Hz (x 60 for enhanced precision in IIR filter, 1 us ticks)
+// volatile: also read by the idle loop (line_freq/60 = measured half-cycle in
+// ticks) to keep dimcomp's period basis calibrated to the real mains frequency
+// and the internal RC oscillator's actual tick rate. See main()'s idle loop.
+static volatile uint32_t line_freq          = 10000 * 60; // Guess we are at 50 Hz (x 60 for enhanced precision in IIR filter, 1 us ticks)
 static uint32_t line_freq_counter           = 10000; // Guess we are at 50 Hz (1 us ticks)
 
 static uint32_t tim_ccr1_now                = 0;
@@ -152,9 +155,11 @@ static uint8_t period_index = 0;
 static bool is_flickering_array[3] = {false};
 
 // Per-cycle PLC-signal flicker compensation (see dimcomp.c). Only engaged
-// while is_flickering is true. n_half is the nominal timer ticks per mains
-// half-cycle (1 us/tick): 10 ms for the assumed 50 Hz mains.
-#define DIMCOMP_N_HALF              10000
+// while is_flickering is true. This is just the STARTUP seed for the half-cycle
+// length (1 us/tick, ~10 ms at 50 Hz); at runtime dimcomp tracks the measured
+// half-cycle line_freq/60 instead, so it self-calibrates to the actual mains
+// frequency and oscillator tick rate (same basis brightness_adj already uses).
+#define DIMCOMP_N_HALF              9990
 static dimcomp_t dimcomp;
 static uint32_t  dimcomp_ts        = 0; // free-running full-cycle timestamp (ticks)
 static int32_t   dimcomp_dt_second = 0; // 2nd half-cycle correction, applied on the falling edge
@@ -946,7 +951,8 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
             // the window start no longer rides the signal's displacement of
             // the falling edge. Clamps at 0 if the anchor would land before
             // this edge; base_guard (below) grows to give it headroom.
-            int32_t b2 = (int32_t)DIMCOMP_N_HALF + (int32_t)dimcomp.oc3_offset
+            int32_t n_half = (int32_t)(line_freq / 60);
+            int32_t b2 = n_half + (int32_t)dimcomp.oc3_offset
                        - (int32_t)tim1_now + (int32_t)base_rising + base_guard;
             if (b2 < 0)
                 b2 = 0;
@@ -954,8 +960,9 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
         }
 
         int32_t t = (int32_t)brightness_adj + dt;
-        if (t < 0)                t = 0;
-        if (t > DIMCOMP_N_HALF)   t = DIMCOMP_N_HALF;
+        int32_t n_half = (int32_t)(line_freq / 60);
+        if (t < 0)        t = 0;
+        if (t > n_half)   t = n_half;
         t_dim = (uint32_t)t;
     }
 
@@ -1079,9 +1086,19 @@ int main(void)
         uint32_t woff = base_rising + (uint32_t)base_guard;
         int32_t wdiff = (int32_t)woff - (int32_t)dimcomp.start_offset;
         if (wdiff < 0) wdiff = -wdiff;
-        if (diff > 4 || wdiff > 8)
+        // Track the measured half-cycle so tau and the correction magnitude
+        // (mul ∝ n_half) stay on the same period basis as brightness_adj.
+        // dimcomp.n_half is written only here (idle loop) and read 16-bit-
+        // atomically by the ZC ISR's output clamp.
+        uint32_t n_half_live = line_freq / 60;
+        int32_t ndiff = (int32_t)n_half_live - (int32_t)dimcomp.n_half;
+        if (ndiff < 0) ndiff = -ndiff;
+        if (diff > 4 || wdiff > 8 || ndiff > 8)
+        {
+            dimcomp.n_half = (uint16_t)n_half_live;
             dimcomp_set_brightness(&dimcomp, (uint16_t)brightness_adj,
                                    (uint16_t)woff);
+        }
     }
 
     return 0;
