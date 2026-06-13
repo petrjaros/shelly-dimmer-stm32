@@ -107,12 +107,15 @@ void dimcomp_init(dimcomp_t *d, uint16_t n_half_ticks)
     d->oc3_offset       = 0;
 
     d->t_dim_nominal = 0;
+    d->start_offset  = 0;
     d->sc_sin        = 0;
     d->sc_cos        = 0;
 }
 
-void dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal)
+void dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal,
+                            uint16_t win_start_offset)
 {
+    d->start_offset = win_start_offset;
     if (t_dim_nominal == 0 || t_dim_nominal >= d->n_half) {
         d->sc_sin = 0;
         d->sc_cos = 0;
@@ -126,10 +129,6 @@ void dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal)
     float tau    = (float)t_dim_nominal / (float)d->n_half;
     float pi_tau = pi * tau;
 
-    float s  = sinf(pi_tau);
-    float s2 = s * s;
-    if (s2 < S2_FLOOR) s2 = S2_FLOOR;
-
     float km = K_RATIO - 1.0f;
     float kp = K_RATIO + 1.0f;
 
@@ -137,42 +136,77 @@ void dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal)
                     (cosf(kp*pi_tau) - 1.0f)/(2.0f*kp*pi);
     float q_tilde = sinf(km*pi_tau)/(2.0f*km*pi) -
                     sinf(kp*pi_tau)/(2.0f*kp*pi);
-    float p_eff   = p_tilde - s2 / (2.0f * pi);
+    /* Companion shape functions for the cos(πy/N)-weighted part of the
+     * window (nonzero once the window starts W > 0 ticks past the ZC):
+     *   P̃c = ∫cos·cos / N,  Q̃c = ∫cos·sin(K·) / N  over [0, τ]. */
+    float pc_tilde = (sinf(kp*pi_tau)/kp + sinf(km*pi_tau)/km) / (2.0f*pi);
+    float qc_tilde = ((1.0f - cosf(kp*pi_tau))/kp +
+                      (1.0f - cosf(km*pi_tau))/km) / (2.0f*pi);
 
-    /* Half-cycle "physical" coefficients (per half-cycle Δt, for M even):
-     *   Δt_even = sc_sin_h · sin(θ_M) + sc_cos_h · cos(θ_M)
-     * with sc_sin_h = -2·mul·P̃_eff,  sc_cos_h = -2·mul·Q̃,  mul = (B/A)·N/sin²(πτ).
-     * For M odd, Δt carries an extra (-1)^M = -1.
+    /* Two physically distinct contributions per half-cycle window (even M),
+     * for a window [W, W+T] starting W ticks after its ZC crossing
+     * (W = base offset the host adds: detector-asymmetry centering + guard):
      *
-     * Coefficients are stored ×SC_SCALE (Q-format with extra fractional bits)
-     * so small Δt values aren't lost to int truncation. The hot path shifts
-     * by (15 + SC_SHIFT) instead of 15 to recover ticks.
+     *   cross term : Δt_x = -2·mul·[(cosW̄·P̃ + sinW̄·P̃c)·sin(θ_win)
+     *                            + (cosW̄·Q̃ + sinW̄·Q̃c)·cos(θ_win)]
+     *                W̄ = π·W/N; θ_win = crossing phase advanced by
+     *                γ = K_RATIO·π·W/N; mul = (B/A)·N / sin²(π(W+T)/N)
+     *                (the energy/Δt slope is taken at the window END).
+     *   boundary   : Δt_b = +C·(1 - sin²W̄/sin²(π(W+T)/N))·sin(θ_cross),
+     *                C = N·(B/A)/π — cancels the jitter of the window
+     *                start, which rides the CROSSING displacement δ
+     *                regardless of the constant offset W, so it keeps the
+     *                un-advanced crossing phase. The (1 - ...) factor is
+     *                the f1²(start)/f1²(end) leak of a start shift.
+     *
+     * The old code folded both into P̃_eff = P̃ - sin²(πτ)/(2π), which is
+     * only valid for W = 0. For M odd both terms flip sign.
+     *
+     * Coefficients are stored ×SC_SCALE (Q-format with extra fractional
+     * bits) so small Δt values aren't lost to int truncation. The hot path
+     * shifts by (15 + SC_SHIFT) instead of 15 to recover ticks.
      */
-    float mul      = B_OVER_A * (float)d->n_half / s2;
-    float sc_sin_h = -2.0f * mul * p_eff;
-    float sc_cos_h = -2.0f * mul * q_tilde;
+    float wbar = pi * (float)win_start_offset / (float)d->n_half;
+    float cw   = cosf(wbar);
+    float sw   = sinf(wbar);
+    float se   = sinf(pi_tau + wbar);     /* f1 envelope at window END   */
+    float s2e  = se * se;
+    if (s2e < S2_FLOOR) s2e = S2_FLOOR;
+
+    float mul    = B_OVER_A * (float)d->n_half / s2e;
+    float cr_sin = -2.0f * mul * (cw * p_tilde + sw * pc_tilde);
+    float cr_cos = -2.0f * mul * (cw * q_tilde + sw * qc_tilde);
+    float cb     = B_OVER_A * (float)d->n_half / pi
+                 * (1.0f - sw * sw / s2e);
 
     /* We estimate (sin,cos)(Θ_{n-1}) where Θ = θ at the start of a FULL cycle.
-     *   First  upcoming half-cycle:  M = 2n+2 → θ_M = Θ_{n-1} + 2α  (α = K_RATIO·π mod 2π)
-     *   Second upcoming half-cycle:  M = 2n+3 → θ_M = Θ_{n-1} + 3α
+     *   First  upcoming crossing:  M = 2n+2 → θ_M = Θ_{n-1} + 2α  (α = K_RATIO·π mod 2π)
+     *   Second upcoming crossing:  M = 2n+3 → θ_M = Θ_{n-1} + 3α
+     * Cross terms get the extra window-start advance γ; boundary terms don't.
      * Apply each rotation and the (-1)^M sign to bake everything into the
      * stored coefficients. */
     float alpha = fmodf(K_RATIO * pi, 2.0f * pi);       /* 0.3332π */
-    float rot1  = fmodf(2.0f * alpha, 2.0f * pi);       /* 0.6664π */
-    float rot2  = fmodf(3.0f * alpha, 2.0f * pi);       /* 0.9996π */
-    float c1 = cosf(rot1), s1 = sinf(rot1);
-    float c2 = cosf(rot2), s2r = sinf(rot2);
+    float gamma = K_RATIO * pi * (float)win_start_offset / (float)d->n_half;
+    float r1b = fmodf(2.0f * alpha, 2.0f * pi);
+    float r2b = fmodf(3.0f * alpha, 2.0f * pi);
+    float r1x = fmodf(r1b + gamma, 2.0f * pi);
+    float r2x = fmodf(r2b + gamma, 2.0f * pi);
 
     /* For Δt = a·cos(θ+r) + b·sin(θ+r) expressed in terms of (sin θ, cos θ):
      *   new_cos = a·cos r + b·sin r
-     *   new_sin = b·cos r − a·sin r           with (a,b) = (sc_cos_h, sc_sin_h) */
+     *   new_sin = b·cos r − a·sin r            with (a,b) = (cos-coef, sin-coef).
+     * Boundary contribution C·sin(θ+r) is the (a,b) = (0, C) case. */
     /* Round-to-nearest at the Q-scale. */
     #define SC_SCALE 256.0f
     #define ROUND(x) ((int32_t)((x) >= 0 ? (x) + 0.5f : (x) - 0.5f))
-    int32_t new_cos1 = ROUND(SC_SCALE * ( sc_cos_h * c1 + sc_sin_h * s1));
-    int32_t new_sin1 = ROUND(SC_SCALE * ( sc_sin_h * c1 - sc_cos_h * s1));
-    int32_t new_cos2 = ROUND(SC_SCALE * (-sc_cos_h * c2 - sc_sin_h * s2r));
-    int32_t new_sin2 = ROUND(SC_SCALE * (-sc_sin_h * c2 + sc_cos_h * s2r));
+    int32_t new_cos1 = ROUND(SC_SCALE * ( cr_cos * cosf(r1x) + cr_sin * sinf(r1x)
+                                         + cb * sinf(r1b)));
+    int32_t new_sin1 = ROUND(SC_SCALE * ( cr_sin * cosf(r1x) - cr_cos * sinf(r1x)
+                                         + cb * cosf(r1b)));
+    int32_t new_cos2 = ROUND(SC_SCALE * (-cr_cos * cosf(r2x) - cr_sin * sinf(r2x)
+                                         - cb * sinf(r2b)));
+    int32_t new_sin2 = ROUND(SC_SCALE * (-cr_sin * cosf(r2x) + cr_cos * sinf(r2x)
+                                         - cb * cosf(r2b)));
     #undef ROUND
     #undef SC_SCALE
 
@@ -199,6 +233,18 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
     /* 2. Sanity gate (now centred on ~2N). */
     int32_t T_avg = d->t_avg_q8 >> 8;
     if (T_n < (T_avg >> 1) || T_n > T_avg + (T_avg >> 1)) {
+        /* Gap or glitch in the call stream — e.g. the host stopped calling
+         * between signal bursts. v_prev, u_recent and the phasor all
+         * describe the signal from before the gap, so fall back to fresh
+         * detection: correcting from the stale phase blinked the light at
+         * the start of every burst. warmup=1 spends one call re-seeding
+         * v_prev before the phase recovery is trusted again. */
+        d->warmup           = 1;
+        d->signal_active    = 0;
+        d->smoothing_seeded = 0;
+        d->u_recent[0]      = 0;
+        d->u_recent[1]      = 0;
+        d->u_recent[2]      = 0;
         d->t_dim_second = d->t_dim_nominal;
         d->oc3_offset = 0;
         return d->t_dim_nominal;
@@ -296,8 +342,8 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
     int32_t mix3 = d->oc3_sin_coef * (int32_t)d->sin_th_q15
                  + d->oc3_cos_coef * (int32_t)d->cos_th_q15;
     int32_t oc3 = (mix3 + (1 << 22)) >> 23;
-    if (oc3 >  127) oc3 =  127;   /* sanity clamp — peak |offset| ≈ K ≈ 15 */
-    if (oc3 < -128) oc3 = -128;
+    if (oc3 >  300) oc3 =  300;   /* sanity clamp — peak |offset| = 2C·cos(α/2) ≈ 134 */
+    if (oc3 < -300) oc3 = -300;
     d->oc3_offset = (int16_t)oc3;
 
     /* 8. Clamp and apply (independently for each half-cycle). */

@@ -118,7 +118,10 @@ static uint32_t low_brightness_threshold    = 0; // switch on the mosfets later 
 // Per-half-cycle start offset used to compensate for the asymmetric duty
 // cycle of the zero-cross detector, so both mains half-cycles conduct an
 // equal window (kills the steady low-brightness flicker). See on_trigger().
-static uint32_t base_rising                 = 0;
+// base_rising is volatile because the idle loop reads it (together with
+// base_guard) to decide when dimcomp's coefficients must be recomputed for
+// a changed window-start offset.
+static volatile uint32_t base_rising        = 0;
 static uint32_t base_falling                = 0;
 static int32_t  corr_acc                     = 0; // low-pass accumulator (x8)
 
@@ -155,6 +158,11 @@ static bool is_flickering_array[3] = {false};
 static dimcomp_t dimcomp;
 static uint32_t  dimcomp_ts        = 0; // free-running full-cycle timestamp (ticks)
 static int32_t   dimcomp_dt_second = 0; // 2nd half-cycle correction, applied on the falling edge
+// Shared start offset added to BOTH half-cycle windows. Stays 0 unless the
+// predicted-crossing anchor for the 2nd half-cycle (see on_trigger) needs
+// headroom in front of the falling ZC edge; then it ramps up slowly.
+// Volatile: read by the idle loop, see base_rising above.
+static volatile int32_t base_guard = 0;
 
 static void ring_init(struct ring *ring, uint8_t *buf, ring_size_t size)
 {
@@ -898,16 +906,25 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
     // live brightness_adj so brightness tracking stays exact. dimcomp's own
     // signal detector returns the nominal (zero delta) when it sees no signal,
     // so this is safe even if is_flickering is a false positive.
+    // Advance dimcomp's timestamp every full cycle, including cycles where
+    // compensation is disabled: after a quiet gap between signal bursts the
+    // first dimcomp_on_zc call then sees one huge T_n, trips its sanity gate
+    // and re-arms its detection from scratch, instead of silently applying a
+    // correction from a phase estimate frozen at the end of the last burst.
+    if (is_rising)
+        dimcomp_ts += period;
+
     uint32_t t_dim = brightness_adj;
-    if (is_flickering)
+    uint32_t base  = (is_rising ? base_rising : base_falling)
+                   + (uint32_t)base_guard;
+    // dimcomp models a trailing-edge window [ZC, ZC + t_dim]; in leading-edge
+    // mode the conduction window is the complement and the correction would
+    // be misapplied, so compensation is trailing-edge only for now.
+    if (is_flickering && !leading_edge)
     {
         int32_t dt;
         if (is_rising)
         {
-            // dimcomp only needs the inter-call delta; advancing our own
-            // accumulator by the measured full-cycle period keeps T_n correct
-            // even across cycles where compensation was disabled.
-            dimcomp_ts += period;
             uint16_t t1 = dimcomp_on_zc(&dimcomp, dimcomp_ts);
             dt = (int32_t)t1 - (int32_t)dimcomp.t_dim_nominal;
             dimcomp_dt_second = (int32_t)dimcomp.t_dim_second -
@@ -916,6 +933,24 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
         else
         {
             dt = dimcomp_dt_second;
+
+            // Anchor the 2nd window at the zero crossing dimcomp predicted,
+            // i.e. at "rising edge + N + oc3", instead of at this falling
+            // detector edge. The falling edge sits (high - N) ticks away from
+            // mid-cycle (the detector's duty asymmetry), which at 216.66 Hz
+            // is a phase error of tens of degrees in the correction's
+            // dominant boundary term — enough to leave the falling-edge
+            // half-cycles essentially uncompensated (verified in simulation;
+            // see dimcomp.h usage notes). Subtracting the measured high
+            // duration (tim1_now) also cancels this edge's own ZC jitter, so
+            // the window start no longer rides the signal's displacement of
+            // the falling edge. Clamps at 0 if the anchor would land before
+            // this edge; base_guard (below) grows to give it headroom.
+            int32_t b2 = (int32_t)DIMCOMP_N_HALF + (int32_t)dimcomp.oc3_offset
+                       - (int32_t)tim1_now + (int32_t)base_rising + base_guard;
+            if (b2 < 0)
+                b2 = 0;
+            base = (uint32_t)b2;
         }
 
         int32_t t = (int32_t)brightness_adj + dt;
@@ -924,7 +959,7 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
         t_dim = (uint32_t)t;
     }
 
-    apply_brightness_at(is_rising ? base_rising : base_falling, t_dim);
+    apply_brightness_at(base, t_dim);
 
     // ---- Per-cycle bookkeeping. Runs after the timer is programmed so its
     // latency (and any jitter) no longer shifts the switching instants. ----
@@ -970,6 +1005,22 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
             base_rising = 0;
             base_falling = -corr;
         }
+
+        // The 2nd-half window is re-anchored to "rising edge + N + oc3" while
+        // compensating (see above); measured from the falling edge that is
+        // ~base_falling + oc3, and oc3 swings roughly +-140 ticks. On hardware
+        // where the falling detector edge comes late (base_falling ~ 0) the
+        // anchor would clip at the falling edge and lose half the correction.
+        // Grow a shared start offset on BOTH windows until the anchor has
+        // headroom; 1 tick/cycle keeps the brightness drift invisible, and it
+        // stays 0 on hardware where base_falling is already large enough.
+        int32_t guard_target = 150 - (int32_t)base_falling;
+        if (guard_target < 0)
+            guard_target = 0;
+        if (base_guard < guard_target)
+            base_guard++;
+        else if (base_guard > guard_target)
+            base_guard--;
 
         // Metering: update once per full line cycle.
         current_max_period = current_total / adc_count;
@@ -1017,14 +1068,20 @@ int main(void)
     {
         // dimcomp_set_brightness uses sinf/cosf to recompute the correction
         // coefficients and must therefore stay out of the switching ISR. Run
-        // it here in the idle loop whenever the live dim time has moved enough
-        // to matter (a small deadband ignores per-cycle mains jitter). The
-        // ISR keeps tracking exact brightness via brightness_adj regardless,
-        // so a few ticks of lag in the coefficients is harmless.
+        // it here in the idle loop whenever the live dim time OR the window-
+        // start offset (base_rising + base_guard, baked into the coefficient
+        // phases) has moved enough to matter (small deadbands ignore
+        // per-cycle mains jitter). The ISR keeps tracking exact brightness
+        // via brightness_adj regardless, so a few ticks of lag in the
+        // coefficients is harmless.
         int32_t diff = (int32_t)brightness_adj - (int32_t)dimcomp.t_dim_nominal;
         if (diff < 0) diff = -diff;
-        if (diff > 4)
-            dimcomp_set_brightness(&dimcomp, (uint16_t)brightness_adj);
+        uint32_t woff = base_rising + (uint32_t)base_guard;
+        int32_t wdiff = (int32_t)woff - (int32_t)dimcomp.start_offset;
+        if (wdiff < 0) wdiff = -wdiff;
+        if (diff > 4 || wdiff > 8)
+            dimcomp_set_brightness(&dimcomp, (uint16_t)brightness_adj,
+                                   (uint16_t)woff);
     }
 
     return 0;

@@ -62,6 +62,8 @@ typedef struct {
 
     /* --- recomputed on brightness change --- */
     uint16_t t_dim_nominal;   /* what the user asked for                   */
+    uint16_t start_offset;    /* window-start offset W baked into sc_*:    */
+                              /* windows begin W ticks after their crossing */
     int32_t  sc_sin;          /* FIRST  half-cycle Δt coefficients         */
     int32_t  sc_cos;          /*   Δt = (sc_sin*sin + sc_cos*cos) >> 15    */
     int32_t  sc_sin2;         /* SECOND half-cycle Δt coefficients         */
@@ -90,8 +92,14 @@ typedef struct {
 /* Initialize. n_half_ticks = nominal timer ticks per mains half-cycle. */
 void     dimcomp_init(dimcomp_t *d, uint16_t n_half_ticks);
 
-/* Call when user changes the brightness setting (uses floats; not for ISR). */
-void     dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal);
+/* Call when the brightness setting OR the window-start offset changes (uses
+ * floats; not for ISR). win_start_offset = constant ticks between a ZC
+ * crossing and the start of its conduction window (detector-asymmetry
+ * centering + guard offsets the host applies). The 216 Hz signal advances
+ * ~0.08 rad per 100 ticks, so an unaccounted offset of a few hundred ticks
+ * visibly misphases the correction. */
+void     dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal,
+                                uint16_t win_start_offset);
 
 /* Call from the zero-crossing ISR. Returns the corrected t_dim (ticks) to
  * use for the half-cycle that just began. Integer-only, no transcendentals. */
