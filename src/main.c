@@ -125,12 +125,6 @@ static uint32_t low_brightness_threshold    = 0; // parsed from settings; unused
 // energy-balanced without any detector-asymmetry centering.
 static volatile uint32_t n_half             = 10000;
 
-// Raw full-cycle period (ticks) captured by on_trigger on each rising edge and
-// consumed once per cycle by the idle loop; cycle_seq is bumped alongside it so
-// the idle loop processes each cycle exactly once. Both volatile (ISR->main).
-static volatile uint32_t period_raw         = 0;
-static volatile uint32_t cycle_seq          = 0;
-
 static uint16_t adc_data[ADC_NUM_CHANNELS]  = {0};
 static uint8_t  adc_channels[ADC_NUM_CHANNELS] =
 {
@@ -153,8 +147,9 @@ static volatile uint16_t max_brightness     = 500;  // set by TIM2 ISR, read by 
 static volatile uint16_t max_brightness     = 1000; // set by TIM2 ISR, read by idle loop
 #endif
 
-// Written by the idle loop, read by the ZC ISR (on_trigger) to gate dimcomp.
-static volatile bool is_flickering = false;
+// Computed and consumed in the ZC ISR (on_trigger): gates the dimcomp
+// correction. Runs every cycle there so no disturbed cycle is missed.
+static bool is_flickering = false;
 static uint8_t period_index = 0;
 static bool is_flickering_array[3] = {false};
 
@@ -759,8 +754,8 @@ static void exti_setup(void)
     exti_select_source(EXTI2, GPIOB);
     exti_select_source(EXTI7, GPIOB);
 
-    exti_set_trigger(EXTI2, EXTI_TRIGGER_BOTH);
-    exti_set_trigger(EXTI7, EXTI_TRIGGER_BOTH);
+    exti_set_trigger(EXTI2, EXTI_TRIGGER_RISING);
+    exti_set_trigger(EXTI7, EXTI_TRIGGER_RISING);
 
     // Finally enable EXTI2 and EXTI7
     exti_enable_request(EXTI2);
@@ -842,7 +837,7 @@ static void mosfet_off(void) {
     }
 }
 
-static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
+static void on_trigger(void)
 {
     // Only the rising-edge zero crossing drives the timing: it resets TIM1 and
     // programs the whole upcoming mains cycle. The falling edge is ignored, so
@@ -850,8 +845,6 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
     // one program measured from this single reset. Both halves therefore start
     // at the same offset from their own true zero crossing, so they stay
     // energy-balanced without any detector-asymmetry centering.
-    if (!gpio_get(gpio_bank, gpio_pin))
-        return;
 
     uint16_t tim1_now = timer_get_counter(TIM1);
     timer_set_counter(TIM1, 0);
@@ -892,6 +885,20 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
     // signal-displaced 2nd zero crossing so it stays soft too. Leading-edge mode
     // uses the complementary window, which dimcomp does not model, so
     // compensation is trailing-edge only.
+    // HDO-flicker detection, done BEFORE the gate below so compensation engages
+    // on THIS disturbed cycle rather than the next (zero lag). The nominal
+    // full-cycle period is 2*n_half, and n_half is already loaded, so this costs
+    // no divide on the switching path; the exact line_freq IIR update stays
+    // after the compares are programmed. This 3-cycle max-detector must run every
+    // mains cycle, which is why it lives in the ISR and not the idle loop (which
+    // can skip cycles while dimcomp_set_brightness runs and drop samples).
+    uint32_t nominal = nh * 2;
+    period_index = (period_index + 1) % 3;
+    is_flickering_array[period_index] =
+        period > nominal + 70 || period < nominal - 70;
+    is_flickering = is_flickering_array[0] ||
+                    is_flickering_array[1] || is_flickering_array[2];
+
     uint32_t t1  = badj;   // 1st half-cycle off-time
     uint32_t t2  = badj;   // 2nd half-cycle off-time
     int32_t  oc3 = 0;      // 2nd half-cycle ZC shift
@@ -919,11 +926,10 @@ static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
     timer_set_oc_value(TIM1, TIM_OC2, on2);
     timer_set_oc_value(TIM1, TIM_OC3, off2);
 
-    // Hand the raw period to the idle loop, which does all the division-heavy
-    // per-cycle work (line_freq, n_half, brightness, flicker detection) off the
-    // switching path. Bump the sequence so it processes this cycle exactly once.
-    period_raw = period;
-    cycle_seq++;
+    // line_freq IIR: x60 running mean of the full-cycle period. Kept here, after
+    // the compares are programmed, so its divide adds no switching latency. The
+    // idle loop reads it (volatile) to derive n_half and brightness_adj.
+    line_freq = line_freq - line_freq / 30 + period;
 
     // Metering: update once per full line cycle. Kept here - after the compares
     // are programmed, so it adds no switching latency - because it races the
@@ -964,39 +970,20 @@ int main(void)
     dimcomp_init(&dimcomp, DIMCOMP_N_HALF);
 
     // Keep doing this forever
-    uint32_t last_seq = 0;
     while (1)
     {
-        // ---- Per-cycle work moved off the switching ISR. ----
-        // The ZC ISR captures the raw period and bumps cycle_seq; do every
-        // division-heavy computation here instead, then publish the results as
-        // single-word atomic globals the ISR only adds together. This keeps the
-        // ~20 us of M0 software divides off the turn-on path and avoids the
-        // multi-word torn read that a compound coefficient set would risk.
-        uint32_t seq = cycle_seq;
-        if (seq != last_seq)
-        {
-            last_seq = seq;
-            uint32_t period = period_raw;
+        // ---- Precompute the OC-value inputs off the switching path. ----
+        // These divisions run in the idle loop from the mains period the ZC ISR
+        // maintains in line_freq (volatile). Published as single-word atomic
+        // globals the ISR only adds together; a one-cycle lag is invisible as
+        // they drift << 1 tick/cycle.
+        n_half = line_freq / 60;
 
-            // Mains-frequency IIR (full-cycle basis, x60 for filter precision).
-            line_freq = line_freq - line_freq / 30 + period;
-            n_half = line_freq / 60;
-
-            // Brightness mapping + scaling to the measured mains period.
-            uint16_t b = brightness_req * max_brightness / 1000;
-            b = leading_edge ? 1000 - b : b;
-            brightness = b;
-            brightness_adj = (uint32_t)b * line_freq / 60000;
-
-            // 3-sample HDO-flicker detector: a period far off nominal marks a
-            // disturbed cycle; any of the last 3 disturbed => compensate.
-            period_index = (period_index + 1) % 3;
-            is_flickering_array[period_index] =
-                period > (line_freq / 30 + 70) || period < (line_freq / 30 - 70);
-            is_flickering = is_flickering_array[0] ||
-                            is_flickering_array[1] || is_flickering_array[2];
-        }
+        // Brightness mapping + scaling to the measured mains period.
+        uint16_t b = brightness_req * max_brightness / 1000;
+        b = leading_edge ? 1000 - b : b;
+        brightness = b;
+        brightness_adj = (uint32_t)b * line_freq / 60000;
 
         // dimcomp_set_brightness uses sinf/cosf to recompute the correction
         // coefficients and must therefore stay out of the switching ISR. Run it
@@ -1152,7 +1139,7 @@ void exti2_3_isr(void)
     // Reset interupt request
     exti_reset_request(EXTI2);
 
-    on_trigger(GPIOB, GPIO2);
+    on_trigger();
 }
 
 void exti4_15_isr(void)
@@ -1167,5 +1154,5 @@ void exti4_15_isr(void)
     // Ignore EXTI2 interupts so we don't trigger twice
     exti_disable_request(EXTI2);
 
-    on_trigger(GPIOB, GPIO7);
+    on_trigger();
 }
