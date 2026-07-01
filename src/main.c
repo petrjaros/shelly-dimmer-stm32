@@ -82,7 +82,6 @@ static uint32_t systick_ms                  = 0;
 // ticks) to keep dimcomp's period basis calibrated to the real mains frequency
 // and the internal RC oscillator's actual tick rate. See main()'s idle loop.
 static volatile uint32_t line_freq          = 10000 * 60; // Guess we are at 50 Hz (x 60 for enhanced precision in IIR filter, 1 us ticks)
-static uint32_t line_freq_counter           = 10000; // Guess we are at 50 Hz (1 us ticks)
 
 static uint32_t tim_ccr1_now                = 0;
 static uint32_t tim_ccr1_last               = 0;
@@ -107,26 +106,30 @@ hw_types;
 
 static hw_types hw_version                  = dimmer2;
 
-static uint16_t brightness                  = 0;
-static uint16_t brightness_req              = 0;
-// Written by the zero-cross ISR (on_trigger) and polled by the idle loop to
-// resync dimcomp's coefficients, so it must be volatile: without it the
-// compiler hoists the read out of the idle loop and collapses it to a dead
-// self-spin, leaving dimcomp permanently uncompensated.
+// brightness is computed in the idle loop (main) and read by the switching
+// ISRs (on_trigger, tim1_cc_isr), so it must be volatile.
+static volatile uint16_t brightness         = 0;
+static volatile uint16_t brightness_req    = 0; // set by USART ISR, read by idle loop
+// Computed in the idle loop and read by the zero-cross ISR (on_trigger), which
+// composes the OC compare values from it. Volatile: it crosses the idle-loop /
+// ISR boundary. Carries brightness scaled to the measured mains period.
 static volatile uint32_t brightness_adj    = 0;
 
-static bool     leading_edge                = false;
-static uint32_t low_brightness_threshold    = 0; // switch on the mosfets later for low brightness (default to 0)
+static volatile bool leading_edge           = false; // set by USART ISR, read by idle loop + ZC ISR
+static uint32_t low_brightness_threshold    = 0; // parsed from settings; unused since the base-offset removal
 
-// Per-half-cycle start offset used to compensate for the asymmetric duty
-// cycle of the zero-cross detector, so both mains half-cycles conduct an
-// equal window (kills the steady low-brightness flicker). See on_trigger().
-// base_rising is volatile because the idle loop reads it (together with
-// base_guard) to decide when dimcomp's coefficients must be recomputed for
-// a changed window-start offset.
-static volatile uint32_t base_rising        = 0;
-static uint32_t base_falling                = 0;
-static int32_t  corr_acc                     = 0; // low-pass accumulator (x8)
+// Measured mains half-cycle (ticks) = line_freq/60, computed in the idle loop
+// and read by the zero-cross ISR to anchor the 2nd half-cycle at n_half. The
+// conduction window always starts at the zero crossing (no base offset), so
+// both half-cycles conduct at the same offset from their true ZC and stay
+// energy-balanced without any detector-asymmetry centering.
+static volatile uint32_t n_half             = 10000;
+
+// Raw full-cycle period (ticks) captured by on_trigger on each rising edge and
+// consumed once per cycle by the idle loop; cycle_seq is bumped alongside it so
+// the idle loop processes each cycle exactly once. Both volatile (ISR->main).
+static volatile uint32_t period_raw         = 0;
+static volatile uint32_t cycle_seq          = 0;
 
 static uint16_t adc_data[ADC_NUM_CHANNELS]  = {0};
 static uint8_t  adc_channels[ADC_NUM_CHANNELS] =
@@ -145,12 +148,13 @@ static uint16_t voltage_max                 = 0;
 static uint16_t voltage_max_period          = 0;
 static uint32_t voltage_total               = 0;
 #ifdef SHD_NO_NEUTRAL
-static uint16_t max_brightness              = 500;
+static volatile uint16_t max_brightness     = 500;  // set by TIM2 ISR, read by idle loop
 #else
-static uint16_t max_brightness              = 1000;
+static volatile uint16_t max_brightness     = 1000; // set by TIM2 ISR, read by idle loop
 #endif
 
-static bool is_flickering = false;
+// Written by the idle loop, read by the ZC ISR (on_trigger) to gate dimcomp.
+static volatile bool is_flickering = false;
 static uint8_t period_index = 0;
 static bool is_flickering_array[3] = {false};
 
@@ -162,12 +166,6 @@ static bool is_flickering_array[3] = {false};
 #define DIMCOMP_N_HALF              9990
 static dimcomp_t dimcomp;
 static uint32_t  dimcomp_ts        = 0; // free-running full-cycle timestamp (ticks)
-static int32_t   dimcomp_dt_second = 0; // 2nd half-cycle correction, applied on the falling edge
-// Shared start offset added to BOTH half-cycle windows. Stays 0 unless the
-// predicted-crossing anchor for the 2nd half-cycle (see on_trigger) needs
-// headroom in front of the falling ZC edge; then it ramps up slowly.
-// Volatile: read by the idle loop, see base_rising above.
-static volatile int32_t base_guard = 0;
 
 static void ring_init(struct ring *ring, uint8_t *buf, ring_size_t size)
 {
@@ -646,8 +644,19 @@ static void timer1_setup(void)
     timer_continuous_mode(TIM1);
     timer_set_period(TIM1, 65535);
 
+    // Three compare events per full mains cycle: OC1 = end of the 1st
+    // half-cycle conduction (off), OC2 = start of the 2nd half-cycle (on),
+    // OC3 = end of the 2nd half-cycle (off). The 1st half-cycle turn-on is done
+    // in software at the rising-edge ZC (see on_trigger).
     timer_enable_irq(TIM1, TIM_DIER_CC1IE);
     timer_enable_irq(TIM1, TIM_DIER_CC2IE);
+    timer_enable_irq(TIM1, TIM_DIER_CC3IE);
+
+    // Seed all three compares past a half-cycle so nothing fires before the
+    // first zero crossing programs them.
+    timer_set_oc_value(TIM1, TIM_OC1, 60000);
+    timer_set_oc_value(TIM1, TIM_OC2, 60000);
+    timer_set_oc_value(TIM1, TIM_OC3, 60000);
 
     // Finally enable timer 1
     timer_enable_counter(TIM1);
@@ -833,215 +842,99 @@ static void mosfet_off(void) {
     }
 }
 
-static void apply_brightness_at(uint32_t base, uint32_t t_dim)
-{
-    uint32_t on_val, off_val;
-
-    if (t_dim < low_brightness_threshold)
-    {
-        off_val = base + low_brightness_threshold;
-        on_val  = base + low_brightness_threshold - t_dim;
-    }
-    else if (t_dim > 0)
-    {
-        off_val = base + t_dim;
-        on_val  = base;
-    }
-    else
-    {
-        return;     // brightness 0 - leave the MOSFETs off
-    }
-
-    timer_set_oc_value(TIM1, TIM_OC1, off_val);
-    timer_set_oc_value(TIM1, TIM_OC2, on_val);
-
-    // The OC2 compare turns the MOSFETs on at counter == on_val. But this runs
-    // late in on_trigger: the counter was reset at the zero crossing and then a
-    // chunk of work ran before we get here - notably the rising edge does
-    // several software divisions (no HW divider on M0), ~15-20 us, vs ~7 us on
-    // the falling edge. If on_val is smaller than that elapsed time, the
-    // compare value is already in the past, CC2 never fires, and the half-cycle
-    // stays dark - and because the two edges have different latency, the two
-    // half-cycles go dark unequally, which is a steady 50 Hz flicker at low
-    // brightness (where on_val/base is tiny). Switch on directly if we have
-    // already passed on_val. This also covers on_val == 0, where the compare
-    // can never match after the counter reset.
-    if (timer_get_counter(TIM1) >= on_val)
-        mosfet_on();
-}
-
 static void on_trigger(uint32_t gpio_bank, uint32_t gpio_pin)
 {
+    // Only the rising-edge zero crossing drives the timing: it resets TIM1 and
+    // programs the whole upcoming mains cycle. The falling edge is ignored, so
+    // TIM1 free-runs across the full cycle and both half-cycles are covered by
+    // one program measured from this single reset. Both halves therefore start
+    // at the same offset from their own true zero crossing, so they stay
+    // energy-balanced without any detector-asymmetry centering.
+    if (!gpio_get(gpio_bank, gpio_pin))
+        return;
+
     uint16_t tim1_now = timer_get_counter(TIM1);
     timer_set_counter(TIM1, 0);
-    bool is_rising = gpio_get(gpio_bank, gpio_pin);
-    // Have we triggered too early? If so return straight away
+
+    // Rising-to-rising gap far below one mains period => spurious/bounced edge.
     if (tim1_now < 7500)
         return;
 
-    // Full-cycle period (high duration from the last falling edge + the
-    // duration since). Only meaningful on the rising edge; computed here so it
-    // is available before the bookkeeping that consumes it.
-    uint32_t period = line_freq_counter + tim1_now;
+    uint32_t period = tim1_now;   // full cycle, measured rising-to-rising
 
-    // ---- Program the dimmer FIRST, before the per-cycle bookkeeping below. ----
-    // That bookkeeping - especially the rising edge's line_freq / corr /
-    // is_flickering work - is several software divisions on the divider-less M0
-    // (~20 us) and differs between the two edges. Running it before the timer
-    // was programmed delayed the turn-on compare unequally for the two
-    // half-cycles, which at low brightness missed small compare values and
-    // darkened one half - a steady 50 Hz imbalance. We program from values
-    // carried over from the previous cycle (base_rising/base_falling, and
-    // line_freq for brightness_adj); both drift far less than a tick per cycle,
-    // so using them one cycle early is invisible, while the turn-on now lands
-    // with minimal, matched latency on both edges.
+    // ---- Turn on as soon as possible. ----
+    // The 1st half-cycle conducts straight from the zero crossing (window start
+    // is always 0), so switch on here in software the instant the ZC is
+    // detected - no compare, minimal latency, soft ~0 V leading edge that LED
+    // drivers like. Leading-edge mode inverts brightness and the MOSFET
+    // polarity, so this is the correct action there too (it blanks the start).
+    if (brightness > 0)
+        mosfet_on();
 
-    // Change ouput polarity if needed depending on leading edge mode
-    brightness = brightness_req * max_brightness / 1000;
-    brightness = leading_edge ? 1000 - brightness : brightness;
-
-    // Adjust the brigtness value according to the mains frequency
-    brightness_adj = brightness * line_freq / 60000;
-
-    // While a flicker-inducing data signal rides on the mains, fold in the
-    // per-half-cycle dimcomp correction. dimcomp_on_zc runs once per full
-    // cycle (on the rising edge) and yields a correction for both the first
-    // half-cycle (its return value) and the second (t_dim_second), each as a
-    // small delta around its own nominal. We apply those deltas on top of the
-    // live brightness_adj so brightness tracking stays exact. dimcomp's own
-    // signal detector returns the nominal (zero delta) when it sees no signal,
-    // so this is safe even if is_flickering is a false positive.
     // Advance dimcomp's timestamp every full cycle, including cycles where
     // compensation is disabled: after a quiet gap between signal bursts the
     // first dimcomp_on_zc call then sees one huge T_n, trips its sanity gate
     // and re-arms its detection from scratch, instead of silently applying a
     // correction from a phase estimate frozen at the end of the last burst.
-    if (is_rising)
-        dimcomp_ts += period;
+    dimcomp_ts += period;
 
-    uint32_t t_dim = brightness_adj;
-    uint32_t base  = (is_rising ? base_rising : base_falling)
-                   + (uint32_t)base_guard;
-    // dimcomp models a trailing-edge window [ZC, ZC + t_dim]; in leading-edge
-    // mode the conduction window is the complement and the correction would
-    // be misapplied, so compensation is trailing-edge only for now.
+    // Read the values the idle loop precomputed for this cycle. Each is a single
+    // atomic word; a one-cycle lag is invisible as they drift << 1 tick/cycle,
+    // and doing the divisions in main keeps them off the switching path.
+    uint32_t nh   = n_half;
+    uint32_t badj = brightness_adj;
+
+    // Off-times for both half-cycles, plus the 2nd-half turn-on anchor. While an
+    // HDO data signal rides on the mains, fold in dimcomp's per-half correction:
+    // dimcomp models a trailing-edge window [ZC, ZC + t_dim] with a zero start
+    // offset (its simplest, exact case), keeping each half-cycle's delivered
+    // energy constant, and oc3_offset re-anchors the 2nd-half turn-on onto the
+    // signal-displaced 2nd zero crossing so it stays soft too. Leading-edge mode
+    // uses the complementary window, which dimcomp does not model, so
+    // compensation is trailing-edge only.
+    uint32_t t1  = badj;   // 1st half-cycle off-time
+    uint32_t t2  = badj;   // 2nd half-cycle off-time
+    int32_t  oc3 = 0;      // 2nd half-cycle ZC shift
     if (is_flickering && !leading_edge)
     {
-        int32_t dt;
-        if (is_rising)
-        {
-            uint16_t t1 = dimcomp_on_zc(&dimcomp, dimcomp_ts);
-            dt = (int32_t)t1 - (int32_t)dimcomp.t_dim_nominal;
-            dimcomp_dt_second = (int32_t)dimcomp.t_dim_second -
-                                (int32_t)dimcomp.t_dim_nominal;
-        }
-        else
-        {
-            dt = dimcomp_dt_second;
-
-            // Anchor the 2nd window at the zero crossing dimcomp predicted,
-            // i.e. at "rising edge + N + oc3", instead of at this falling
-            // detector edge. The falling edge sits (high - N) ticks away from
-            // mid-cycle (the detector's duty asymmetry), which at 216.66 Hz
-            // is a phase error of tens of degrees in the correction's
-            // dominant boundary term — enough to leave the falling-edge
-            // half-cycles essentially uncompensated (verified in simulation;
-            // see dimcomp.h usage notes). Subtracting the measured high
-            // duration (tim1_now) also cancels this edge's own ZC jitter, so
-            // the window start no longer rides the signal's displacement of
-            // the falling edge. Clamps at 0 if the anchor would land before
-            // this edge; base_guard (below) grows to give it headroom.
-            int32_t n_half = (int32_t)(line_freq / 60);
-            int32_t b2 = n_half + (int32_t)dimcomp.oc3_offset
-                       - (int32_t)tim1_now + (int32_t)base_rising + base_guard;
-            if (b2 < 0)
-                b2 = 0;
-            base = (uint32_t)b2;
-        }
-
-        int32_t t = (int32_t)brightness_adj + dt;
-        int32_t n_half = (int32_t)(line_freq / 60);
-        if (t < 0)        t = 0;
-        if (t > n_half)   t = n_half;
-        t_dim = (uint32_t)t;
+        t1  = dimcomp_on_zc(&dimcomp, dimcomp_ts);   // already clamped to [0, n_half]
+        t2  = dimcomp.t_dim_second;
+        oc3 = dimcomp.oc3_offset;
     }
 
-    apply_brightness_at(base, t_dim);
+    uint32_t on2  = nh + oc3;    // 2nd half-cycle turn-on (predicted 2nd ZC)
+    uint32_t off2 = on2 + t2;    // 2nd half-cycle turn-off
 
-    // ---- Per-cycle bookkeeping. Runs after the timer is programmed so its
-    // latency (and any jitter) no longer shifts the switching instants. ----
-    if (is_rising)
-    {
-        period_index = (period_index + 1) % 3;
-        is_flickering_array[period_index] = period > (line_freq / 30 + 70) || period < (line_freq / 30 - 70);
-        is_flickering = is_flickering_array[0] || is_flickering_array[1] || is_flickering_array[2];
+    // Keep the 2nd-half turn-off inside the cycle so it fires before the next
+    // rising edge resets the counter (period ~= 2*n_half). It can only overshoot
+    // near full brightness; exact-full brightness is handled by the endpoint
+    // guard in tim1_cc_isr, so capping just short here is invisible.
+    uint32_t cycle_end = nh * 2;
+    if (off2 >= cycle_end)
+        off2 = cycle_end - 100;
 
-        line_freq = line_freq - line_freq / 30 + period;
+    // OC1 = end of 1st half (off), OC2 = start of 2nd half (on),
+    // OC3 = end of 2nd half (off). The 1st-half turn-on already happened above.
+    timer_set_oc_value(TIM1, TIM_OC1, t1);
+    timer_set_oc_value(TIM1, TIM_OC2, on2);
+    timer_set_oc_value(TIM1, TIM_OC3, off2);
 
-        // The zero-cross detector is not an exact 50% duty signal: its rising
-        // and falling edges sit at different offsets from the true mains zero
-        // crossings (line_freq_counter is the high duration, tim1_now the low
-        // duration). Conducting the same on-time from each edge then delivers
-        // unequal energy to the two half-cycles - a steady 50 Hz shimmer that
-        // is only visible at low brightness, where the on-time is tiny. Delay
-        // the earlier half-cycle by half the difference so both conduct at the
-        // same offset from their zero crossing. Applied from the next cycle on.
-        int32_t target = ((int32_t)line_freq_counter - (int32_t)tim1_now) / 2;
-        // Clamp so a missed/glitched edge can't shove the window into the
-        // half-cycle or poison the filter below.
-        if (target > 2000)
-            target = 2000;
-        else if (target < -2000)
-            target = -2000;
+    // Hand the raw period to the idle loop, which does all the division-heavy
+    // per-cycle work (line_freq, n_half, brightness, flicker detection) off the
+    // switching path. Bump the sequence so it processes this cycle exactly once.
+    period_raw = period;
+    cycle_seq++;
 
-        // Low-pass the correction (~8-cycle time constant). The raw per-cycle
-        // difference jitters by a tick or two from mains jitter and timer
-        // quantisation; feeding that straight into the window position would
-        // itself shimmer. Smoothing leaves a stable offset that still tracks
-        // slow drift.
-        corr_acc = corr_acc - corr_acc / 8 + target;
-        int32_t corr = corr_acc / 8;
-
-        if (corr >= 0)
-        {
-            base_rising = corr;
-            base_falling = 0;
-        }
-        else
-        {
-            base_rising = 0;
-            base_falling = -corr;
-        }
-
-        // The 2nd-half window is re-anchored to "rising edge + N + oc3" while
-        // compensating (see above); measured from the falling edge that is
-        // ~base_falling + oc3, and oc3 swings roughly +-140 ticks. On hardware
-        // where the falling detector edge comes late (base_falling ~ 0) the
-        // anchor would clip at the falling edge and lose half the correction.
-        // Grow a shared start offset on BOTH windows until the anchor has
-        // headroom; 1 tick/cycle keeps the brightness drift invisible, and it
-        // stays 0 on hardware where base_falling is already large enough.
-        int32_t guard_target = 150 - (int32_t)base_falling;
-        if (guard_target < 0)
-            guard_target = 0;
-        if (base_guard < guard_target)
-            base_guard++;
-        else if (base_guard > guard_target)
-            base_guard--;
-
-        // Metering: update once per full line cycle.
-        current_max_period = current_total / adc_count;
-        current_total = 0;
-        current_total_mag_period = current_total_mag / adc_count;
-        current_total_mag = 0;
-        voltage_max_period = voltage_total / adc_count;
-        voltage_total = 0;
-        adc_count = 0;
-    }
-    else
-    {
-        line_freq_counter = tim1_now;
-    }
+    // Metering: update once per full line cycle. Kept here - after the compares
+    // are programmed, so it adds no switching latency - because it races the
+    // TIM3 ADC accumulator, which EXTI preempts but the idle loop would not.
+    current_max_period = current_total / adc_count;
+    current_total = 0;
+    current_total_mag_period = current_total_mag / adc_count;
+    current_total_mag = 0;
+    voltage_max_period = voltage_total / adc_count;
+    voltage_total = 0;
+    adc_count = 0;
 }
 
 int main(void)
@@ -1071,33 +964,55 @@ int main(void)
     dimcomp_init(&dimcomp, DIMCOMP_N_HALF);
 
     // Keep doing this forever
+    uint32_t last_seq = 0;
     while (1)
     {
+        // ---- Per-cycle work moved off the switching ISR. ----
+        // The ZC ISR captures the raw period and bumps cycle_seq; do every
+        // division-heavy computation here instead, then publish the results as
+        // single-word atomic globals the ISR only adds together. This keeps the
+        // ~20 us of M0 software divides off the turn-on path and avoids the
+        // multi-word torn read that a compound coefficient set would risk.
+        uint32_t seq = cycle_seq;
+        if (seq != last_seq)
+        {
+            last_seq = seq;
+            uint32_t period = period_raw;
+
+            // Mains-frequency IIR (full-cycle basis, x60 for filter precision).
+            line_freq = line_freq - line_freq / 30 + period;
+            n_half = line_freq / 60;
+
+            // Brightness mapping + scaling to the measured mains period.
+            uint16_t b = brightness_req * max_brightness / 1000;
+            b = leading_edge ? 1000 - b : b;
+            brightness = b;
+            brightness_adj = (uint32_t)b * line_freq / 60000;
+
+            // 3-sample HDO-flicker detector: a period far off nominal marks a
+            // disturbed cycle; any of the last 3 disturbed => compensate.
+            period_index = (period_index + 1) % 3;
+            is_flickering_array[period_index] =
+                period > (line_freq / 30 + 70) || period < (line_freq / 30 - 70);
+            is_flickering = is_flickering_array[0] ||
+                            is_flickering_array[1] || is_flickering_array[2];
+        }
+
         // dimcomp_set_brightness uses sinf/cosf to recompute the correction
-        // coefficients and must therefore stay out of the switching ISR. Run
-        // it here in the idle loop whenever the live dim time OR the window-
-        // start offset (base_rising + base_guard, baked into the coefficient
-        // phases) has moved enough to matter (small deadbands ignore
-        // per-cycle mains jitter). The ISR keeps tracking exact brightness
-        // via brightness_adj regardless, so a few ticks of lag in the
-        // coefficients is harmless.
+        // coefficients and must therefore stay out of the switching ISR. Run it
+        // here whenever the live dim time OR the measured half-cycle has moved
+        // enough to matter (small deadbands ignore per-cycle mains jitter). The
+        // window-start offset is always 0 now, so it drops out of the trigger.
         int32_t diff = (int32_t)brightness_adj - (int32_t)dimcomp.t_dim_nominal;
         if (diff < 0) diff = -diff;
-        uint32_t woff = base_rising + (uint32_t)base_guard;
-        int32_t wdiff = (int32_t)woff - (int32_t)dimcomp.start_offset;
-        if (wdiff < 0) wdiff = -wdiff;
         // Track the measured half-cycle so tau and the correction magnitude
         // (mul ∝ n_half) stay on the same period basis as brightness_adj.
-        // dimcomp.n_half is written only here (idle loop) and read 16-bit-
-        // atomically by the ZC ISR's output clamp.
-        uint32_t n_half_live = line_freq / 60;
-        int32_t ndiff = (int32_t)n_half_live - (int32_t)dimcomp.n_half;
+        int32_t ndiff = (int32_t)n_half - (int32_t)dimcomp.n_half;
         if (ndiff < 0) ndiff = -ndiff;
-        if (diff > 4 || wdiff > 8 || ndiff > 8)
+        if (diff > 4 || ndiff > 8)
         {
-            dimcomp.n_half = (uint16_t)n_half_live;
-            dimcomp_set_brightness(&dimcomp, (uint16_t)brightness_adj,
-                                   (uint16_t)woff);
+            dimcomp.n_half = (uint16_t)n_half;
+            dimcomp_set_brightness(&dimcomp, (uint16_t)brightness_adj, 0);
         }
     }
 
@@ -1114,26 +1029,29 @@ void sys_tick_handler(void)
 
 void tim1_cc_isr(void)
 {
+    // OC1 = end of the 1st half-cycle conduction: turn off (unless full
+    // brightness, where we stay on for the whole cycle).
     if (timer_get_flag(TIM1, TIM_SR_CC1IF))
     {
-        // Reset interupt flag
         timer_clear_flag(TIM1, TIM_SR_CC1IF);
-
-        // No need to turn off if brightness is full
-        if (brightness == 1000)
-            return;
-
-        // Turn off the MOSFETs
-        mosfet_off();
+        if (brightness != 1000)
+            mosfet_off();
     }
 
+    // OC2 = start of the 2nd half-cycle: turn on (unless brightness is 0).
     if (timer_get_flag(TIM1, TIM_SR_CC2IF))
     {
-        // Reset interupt flag
         timer_clear_flag(TIM1, TIM_SR_CC2IF);
-        if (brightness == 0)
-            return;
-        mosfet_on();
+        if (brightness != 0)
+            mosfet_on();
+    }
+
+    // OC3 = end of the 2nd half-cycle conduction: turn off (unless full).
+    if (timer_get_flag(TIM1, TIM_SR_CC3IF))
+    {
+        timer_clear_flag(TIM1, TIM_SR_CC3IF);
+        if (brightness != 1000)
+            mosfet_off();
     }
 }
 
