@@ -147,17 +147,13 @@ static volatile uint16_t max_brightness     = 500;  // set by TIM2 ISR, read by 
 static volatile uint16_t max_brightness     = 1000; // set by TIM2 ISR, read by idle loop
 #endif
 
-// Computed and consumed in the ZC ISR (on_trigger): gates the dimcomp
-// correction. Runs every cycle there so no disturbed cycle is missed.
-static bool is_flickering = false;
-static uint8_t period_index = 0;
-static bool is_flickering_array[3] = {false};
-
-// Per-cycle PLC-signal flicker compensation (see dimcomp.c). Only engaged
-// while is_flickering is true. This is just the STARTUP seed for the half-cycle
-// length (1 us/tick, ~10 ms at 50 Hz); at runtime dimcomp tracks the measured
-// half-cycle line_freq/60 instead, so it self-calibrates to the actual mains
-// frequency and oscillator tick rate (same basis brightness_adj already uses).
+// Per-cycle PLC-signal flicker compensation (see dimcomp.c). dimcomp_on_zc is
+// called every cycle (except leading-edge) and self-gates via its own signal
+// detector, so there is no separate is_flickering flag. This is just the
+// STARTUP seed for the half-cycle length (1 us/tick, ~10 ms at 50 Hz); at
+// runtime dimcomp tracks the measured half-cycle line_freq/60 instead, so it
+// self-calibrates to the actual mains frequency and oscillator tick rate (same
+// basis brightness_adj already uses).
 #define DIMCOMP_N_HALF              9990
 static dimcomp_t dimcomp;
 static uint32_t  dimcomp_ts        = 0; // free-running full-cycle timestamp (ticks)
@@ -864,11 +860,12 @@ static void on_trigger(void)
     if (brightness > 0)
         mosfet_on();
 
-    // Advance dimcomp's timestamp every full cycle, including cycles where
-    // compensation is disabled: after a quiet gap between signal bursts the
-    // first dimcomp_on_zc call then sees one huge T_n, trips its sanity gate
-    // and re-arms its detection from scratch, instead of silently applying a
-    // correction from a phase estimate frozen at the end of the last burst.
+    // Advance dimcomp's free-running timestamp, and drive dimcomp EVERY cycle
+    // (below) so its phase tracker and signal detector stay primed. That avoids
+    // the huge T_n / sanity-gate re-arm a call gap would cause at each burst
+    // start - the ~2 uncompensated cycles that showed up as a brightness spike
+    // when the HDO signal begins. T_n now stays ~= one period, so the gate never
+    // re-arms spuriously.
     dimcomp_ts += period;
 
     // Read the values the idle loop precomputed for this cycle. Each is a single
@@ -877,32 +874,20 @@ static void on_trigger(void)
     uint32_t nh   = n_half;
     uint32_t badj = brightness_adj;
 
-    // Off-times for both half-cycles, plus the 2nd-half turn-on anchor. While an
-    // HDO data signal rides on the mains, fold in dimcomp's per-half correction:
-    // dimcomp models a trailing-edge window [ZC, ZC + t_dim] with a zero start
-    // offset (its simplest, exact case), keeping each half-cycle's delivered
-    // energy constant, and oc3_offset re-anchors the 2nd-half turn-on onto the
-    // signal-displaced 2nd zero crossing so it stays soft too. Leading-edge mode
-    // uses the complementary window, which dimcomp does not model, so
-    // compensation is trailing-edge only.
-    // HDO-flicker detection, done BEFORE the gate below so compensation engages
-    // on THIS disturbed cycle rather than the next (zero lag). The nominal
-    // full-cycle period is 2*n_half, and n_half is already loaded, so this costs
-    // no divide on the switching path; the exact line_freq IIR update stays
-    // after the compares are programmed. This 3-cycle max-detector must run every
-    // mains cycle, which is why it lives in the ISR and not the idle loop (which
-    // can skip cycles while dimcomp_set_brightness runs and drop samples).
-    uint32_t nominal = nh * 2;
-    period_index = (period_index + 1) % 3;
-    is_flickering_array[period_index] =
-        period > nominal + 70 || period < nominal - 70;
-    is_flickering = is_flickering_array[0] ||
-                    is_flickering_array[1] || is_flickering_array[2];
-
+    // Off-times for both half-cycles, plus the 2nd-half turn-on anchor. dimcomp
+    // models a trailing-edge window [ZC, ZC + t_dim] with a zero start offset
+    // (its simplest, exact case), keeping each half-cycle's delivered energy
+    // constant, and oc3_offset re-anchors the 2nd-half turn-on onto the signal-
+    // displaced 2nd zero crossing so it stays soft too. We call it every cycle
+    // and let dimcomp's OWN signal detector gate the correction: with no signal
+    // it returns t_dim_nominal (== badj to within the idle-loop deadband) and
+    // oc3_offset 0, i.e. the plain symmetric conduction - so no separate
+    // is_flickering gate is needed. Leading-edge mode uses the complementary
+    // window, which dimcomp does not model, so it is bypassed there.
     uint32_t t1  = badj;   // 1st half-cycle off-time
     uint32_t t2  = badj;   // 2nd half-cycle off-time
     int32_t  oc3 = 0;      // 2nd half-cycle ZC shift
-    if (is_flickering && !leading_edge)
+    if (!leading_edge)
     {
         t1  = dimcomp_on_zc(&dimcomp, dimcomp_ts);   // already clamped to [0, n_half]
         t2  = dimcomp.t_dim_second;
@@ -925,6 +910,14 @@ static void on_trigger(void)
     timer_set_oc_value(TIM1, TIM_OC1, t1);
     timer_set_oc_value(TIM1, TIM_OC2, on2);
     timer_set_oc_value(TIM1, TIM_OC3, off2);
+
+    // Safety for a tiny t1 (very low brightness, and dimcomp_on_zc ran before
+    // this): if the counter has already passed t1, the OC1 compare will never
+    // match this cycle, so the 1st half would stay on the whole half-cycle - a
+    // bright flash. Turn it off now instead. Mirrors the CC1 full-brightness
+    // guard; at full brightness t1 = n_half so the counter can't have reached it.
+    if (brightness != 1000 && timer_get_counter(TIM1) >= t1)
+        mosfet_off();
 
     // line_freq IIR: x60 running mean of the full-cycle period. Kept here, after
     // the compares are programmed, so its divide adds no switching latency. The
