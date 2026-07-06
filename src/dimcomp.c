@@ -52,6 +52,16 @@
 #define S2_FLOOR         0.02f
 #define WARMUP_CYCLES    4
 
+/* Fractional bits of the stored sc_* coefficients. The hot-path mix
+ *   sc * phasor(Q15)  must fit in int32, so the largest representable
+ * correction is 2^31 >> (15+SC_SHIFT) ticks. SC_SHIFT=8 capped |Δt| at
+ * 256 ticks: near-full brightness (small sin² at the window end => big
+ * mul) needs ~270, and the mix then WRAPS, flipping the correction sign
+ * on the worst-phase cycles - seen as a +1% energy spike every 3rd cycle.
+ * SC_SHIFT=2 keeps quarter-tick coefficient resolution (quantisation
+ * ~0.1 tick on typical Δt, invisible) and allows |Δt| up to 16384. */
+#define SC_SHIFT         2
+
 void dimcomp_init(dimcomp_t *d, uint16_t n_half_ticks)
 {
     d->n_half = n_half_ticks;
@@ -197,7 +207,7 @@ void dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal,
      *   new_sin = b·cos r − a·sin r            with (a,b) = (cos-coef, sin-coef).
      * Boundary contribution C·sin(θ+r) is the (a,b) = (0, C) case. */
     /* Round-to-nearest at the Q-scale. */
-    #define SC_SCALE 256.0f
+    #define SC_SCALE ((float)(1 << SC_SHIFT))
     #define ROUND(x) ((int32_t)((x) >= 0 ? (x) + 0.5f : (x) - 0.5f))
     int32_t new_cos1 = ROUND(SC_SCALE * ( cr_cos * cosf(r1x) + cr_sin * sinf(r1x)
                                          + cb * sinf(r1b)));
@@ -326,15 +336,16 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
      *    correct θ_M (2α for the first half, 3α for the second) plus the
      *    (-1)^M sign for the second.
      *
-     * Coefficients are stored ×256 (Q8), phasor in Q15, so shift back by 23
-     * with round-to-nearest. Asymmetric truncation would bias negative Δt
-     * values one tick more negative than positive ones. */
+     * Coefficients are stored ×2^SC_SHIFT, phasor in Q15, so shift back by
+     * (15+SC_SHIFT) with round-to-nearest. Asymmetric truncation would bias
+     * negative Δt values one tick more negative than positive ones. The mix
+     * must fit int32 - see the SC_SHIFT note for the resulting |Δt| bound. */
     int32_t mix1 = d->sc_cos  * (int32_t)d->cos_th_q15
                  + d->sc_sin  * (int32_t)d->sin_th_q15;
     int32_t mix2 = d->sc_cos2 * (int32_t)d->cos_th_q15
                  + d->sc_sin2 * (int32_t)d->sin_th_q15;
-    int32_t dt1 = (mix1 + (1 << 22)) >> 23;
-    int32_t dt2 = (mix2 + (1 << 22)) >> 23;
+    int32_t dt1 = (mix1 + (1 << (14 + SC_SHIFT))) >> (15 + SC_SHIFT);
+    int32_t dt2 = (mix2 + (1 << (14 + SC_SHIFT))) >> (15 + SC_SHIFT);
 
     /* 7b. OC3 offset: shift the mid-cycle event from N to N+(δ₂−δ₁) so the
      *     dimmer fires at the predicted ACTUAL second-half ZC, not just N

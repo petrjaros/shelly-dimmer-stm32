@@ -53,6 +53,13 @@
 
 #define SHD_BUFFER_SIZE                     256
 
+// Dimming range: incoming brightness 1..1000 is mapped linearly onto
+// [SHD_DIM_MIN, SHD_DIM_MAX] (same 0..1000 scale, so 70 = 7%). An incoming 0
+// stays off - mapping it up would make the lamp impossible to switch off.
+// Keeps the output inside the range the lamp actually dims usefully over.
+#define SHD_DIM_MIN                         70
+#define SHD_DIM_MAX                         800
+
 #define SHD_CF1_PULSE_TIMEOUT               10000
 #define SHD_CF1_PULSE_MIN                   1
 #define SHD_CF1_PULSE_MAX                   1000
@@ -899,11 +906,20 @@ static void on_trigger(void)
 
     // Keep the 2nd-half turn-off inside the cycle so it fires before the next
     // rising edge resets the counter (period ~= 2*n_half). It can only overshoot
-    // near full brightness; exact-full brightness is handled by the endpoint
-    // guard in tim1_cc_isr, so capping just short here is invisible.
+    // near full brightness, where the shaved ticks sit at the voltage zero and
+    // carry no energy, so capping just short here is invisible.
     uint32_t cycle_end = nh * 2;
     if (off2 >= cycle_end)
         off2 = cycle_end - 100;
+
+    // A large positive 1st-half correction can push t1 past the 2nd-half
+    // turn-on: dimcomp clamps t1 at n_half, but on2 rides the signal-displaced
+    // 2nd ZC and can sit BELOW n_half. OC1 would then fire AFTER OC2 and its
+    // turn-off would darken the entire 2nd half-cycle - a 50% energy drop
+    // repeating at the beat frequency = hard flicker near full brightness.
+    // Merge the windows instead: park the OC1 turn-off on the final OC3 one.
+    if (t1 >= on2)
+        t1 = off2;
 
     // OC1 = end of 1st half (off), OC2 = start of 2nd half (on),
     // OC3 = end of 2nd half (off). The 1st-half turn-on already happened above.
@@ -914,9 +930,9 @@ static void on_trigger(void)
     // Safety for a tiny t1 (very low brightness, and dimcomp_on_zc ran before
     // this): if the counter has already passed t1, the OC1 compare will never
     // match this cycle, so the 1st half would stay on the whole half-cycle - a
-    // bright flash. Turn it off now instead. Mirrors the CC1 full-brightness
-    // guard; at full brightness t1 = n_half so the counter can't have reached it.
-    if (brightness != 1000 && timer_get_counter(TIM1) >= t1)
+    // bright flash. Turn it off now instead. Even at full brightness t1 is at
+    // least the 90% conduction cap, far ahead of the counter, so no gate needed.
+    if (timer_get_counter(TIM1) >= t1)
         mosfet_off();
 
     // line_freq IIR: x60 running mean of the full-cycle period. Kept here, after
@@ -970,29 +986,55 @@ int main(void)
         // maintains in line_freq (volatile). Published as single-word atomic
         // globals the ISR only adds together; a one-cycle lag is invisible as
         // they drift << 1 tick/cycle.
-        n_half = line_freq / 60;
+        uint32_t nh = line_freq / 60;
+        n_half = nh;
 
         // Brightness mapping + scaling to the measured mains period.
-        uint16_t b = brightness_req * max_brightness / 1000;
+        // First map the request onto the configured dimming range (0 = off),
+        // then apply the hardware brightness limit.
+        uint16_t b = 0;
+        if (brightness_req >= 10) {
+            b = SHD_DIM_MIN
+              + (uint32_t)(brightness_req - 10) * (SHD_DIM_MAX - SHD_DIM_MIN) / 990;
+        } else if (brightness_req > 0) {
+            b = SHD_DIM_MIN;
+        }
+        b = b * max_brightness / 1000;
         b = leading_edge ? 1000 - b : b;
         brightness = b;
         brightness_adj = (uint32_t)b * line_freq / 60000;
+
+        // Cap the conduction window dimcomp targets at 90% of the half-cycle.
+        // The shaved tail carries only ~0.6% of the half-cycle's energy (sin^2
+        // tail) - an invisible brightness loss - but the window END is where
+        // the correction slope sin^2(pi*t/N) lives, and it vanishes at N.
+        // Uncapped, brightness near 100% ran the correction on a floored,
+        // wildly wrong gain (S2_FLOOR) and at exactly 100% no correction was
+        // possible at all, so the HDO tone's ~0.6% p-p energy beat showed as
+        // 16.7 Hz flicker. With the cap the correction keeps real, well-
+        // conditioned authority all the way up to full brightness. Only feeds
+        // dimcomp: the leading-edge path (which bypasses dimcomp) still uses
+        // the uncapped brightness_adj, keeping its deep-dimming range intact.
+        uint32_t badj_comp = brightness_adj;
+        uint32_t comp_max  = nh - nh / 10;
+        if (badj_comp > comp_max)
+            badj_comp = comp_max;
 
         // dimcomp_set_brightness uses sinf/cosf to recompute the correction
         // coefficients and must therefore stay out of the switching ISR. Run it
         // here whenever the live dim time OR the measured half-cycle has moved
         // enough to matter (small deadbands ignore per-cycle mains jitter). The
         // window-start offset is always 0 now, so it drops out of the trigger.
-        int32_t diff = (int32_t)brightness_adj - (int32_t)dimcomp.t_dim_nominal;
+        int32_t diff = (int32_t)badj_comp - (int32_t)dimcomp.t_dim_nominal;
         if (diff < 0) diff = -diff;
         // Track the measured half-cycle so tau and the correction magnitude
         // (mul ∝ n_half) stay on the same period basis as brightness_adj.
-        int32_t ndiff = (int32_t)n_half - (int32_t)dimcomp.n_half;
+        int32_t ndiff = (int32_t)nh - (int32_t)dimcomp.n_half;
         if (ndiff < 0) ndiff = -ndiff;
         if (diff > 4 || ndiff > 8)
         {
-            dimcomp.n_half = (uint16_t)n_half;
-            dimcomp_set_brightness(&dimcomp, (uint16_t)brightness_adj, 0);
+            dimcomp.n_half = (uint16_t)nh;
+            dimcomp_set_brightness(&dimcomp, (uint16_t)badj_comp, 0);
         }
     }
 
@@ -1009,13 +1051,15 @@ void sys_tick_handler(void)
 
 void tim1_cc_isr(void)
 {
-    // OC1 = end of the 1st half-cycle conduction: turn off (unless full
-    // brightness, where we stay on for the whole cycle).
+    // OC1 = end of the 1st half-cycle conduction: turn off. Unconditional:
+    // even at full brightness the window is capped at 90% of the half-cycle
+    // so the HDO correction keeps authority (the shaved tail carries ~0.6%
+    // of the energy - invisible - and the old "stay hard-on at 1000" special
+    // case let the tone's energy beat through as 16.7 Hz flicker).
     if (timer_get_flag(TIM1, TIM_SR_CC1IF))
     {
         timer_clear_flag(TIM1, TIM_SR_CC1IF);
-        if (brightness != 1000)
-            mosfet_off();
+        mosfet_off();
     }
 
     // OC2 = start of the 2nd half-cycle: turn on (unless brightness is 0).
@@ -1026,12 +1070,11 @@ void tim1_cc_isr(void)
             mosfet_on();
     }
 
-    // OC3 = end of the 2nd half-cycle conduction: turn off (unless full).
+    // OC3 = end of the 2nd half-cycle conduction: turn off.
     if (timer_get_flag(TIM1, TIM_SR_CC3IF))
     {
         timer_clear_flag(TIM1, TIM_SR_CC3IF);
-        if (brightness != 1000)
-            mosfet_off();
+        mosfet_off();
     }
 }
 
