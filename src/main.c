@@ -60,6 +60,17 @@
 #define SHD_DIM_MIN                         70
 #define SHD_DIM_MAX                         800
 
+// Turn-on kick for stubborn LED drivers: some bulbs' drivers never start up
+// when the light comes on straight into a very short conduction window - the
+// lamp stays dark until the user dims up once. On every off->on transition
+// into a request below SHD_KICK_THRESHOLD the idle loop overrides the request
+// with SHD_KICK_BRIGHTNESS for SHD_KICK_TICKS so the driver starts, then
+// settles to the requested level. (The Shelly protocol has warmup settings
+// for exactly this, but Tasmota never sends them, so the values live here.)
+#define SHD_KICK_THRESHOLD                  100  // kick when turning on below this request (of 1000)
+#define SHD_KICK_BRIGHTNESS                 300  // request level during the kick (of 1000)
+#define SHD_KICK_TICKS                      500 // kick duration in 0.1 ms systick ticks (= 500 ms)
+
 #define SHD_CF1_PULSE_TIMEOUT               10000
 #define SHD_CF1_PULSE_MIN                   1
 #define SHD_CF1_PULSE_MAX                   1000
@@ -84,7 +95,10 @@ static uint8_t  byte_counter                = 0;
 static uint8_t  id                          = 0;
 static uint8_t  cmd                         = 0;
 
-static uint32_t systick_ms                  = 0;
+// volatile: incremented by the systick ISR and read by the idle loop to time
+// the low-brightness turn-on kick. Note: despite the name, one tick = 0.1 ms
+// (systick runs at 10 kHz, see systick_setup).
+static volatile uint32_t systick_ms         = 0;
 // volatile: also read by the idle loop (line_freq/60 = measured half-cycle in
 // ticks) to keep dimcomp's period basis calibrated to the real mains frequency
 // and the internal RC oscillator's actual tick rate. See main()'s idle loop.
@@ -977,6 +991,11 @@ int main(void)
     // Setup the per-cycle flicker compensation model.
     dimcomp_init(&dimcomp, DIMCOMP_N_HALF);
 
+    // Turn-on kick state (see SHD_KICK_*).
+    uint16_t req_prev      = 0;
+    bool     kick_active   = false;
+    uint32_t kick_deadline = 0;
+
     // Keep doing this forever
     while (1)
     {
@@ -988,14 +1007,38 @@ int main(void)
         uint32_t nh = line_freq / 60;
         n_half = nh;
 
+        // Latch the request once per pass - the USART ISR can rewrite it at
+        // any time, and the mapping below must see one consistent value.
+        uint16_t req = brightness_req;
+
+        // Turn-on kick (see SHD_KICK_*): on an off->on transition into the
+        // range the driver won't start from, hold the request at the kick
+        // level until the deadline, then settle to the requested value.
+        // Wrap-safe deadline compare; systick wraps only every ~5 days anyway.
+        if (req == 0)
+            kick_active = false;
+        else if (req_prev == 0 && req < SHD_KICK_THRESHOLD)
+        {
+            kick_active   = true;
+            kick_deadline = systick_ms + SHD_KICK_TICKS;
+        }
+        req_prev = req;
+        if (kick_active)
+        {
+            if ((int32_t)(systick_ms - kick_deadline) >= 0)
+                kick_active = false;
+            else if (req < SHD_KICK_BRIGHTNESS)
+                req = SHD_KICK_BRIGHTNESS;
+        }
+
         // Brightness mapping + scaling to the measured mains period.
         // First map the request onto the configured dimming range (0 = off),
         // then apply the hardware brightness limit.
         uint16_t b = 0;
-        if (brightness_req >= 10) {
+        if (req >= 10) {
             b = SHD_DIM_MIN
-              + (uint32_t)(brightness_req - 10) * (SHD_DIM_MAX - SHD_DIM_MIN) / 990;
-        } else if (brightness_req > 0) {
+              + (uint32_t)(req - 10) * (SHD_DIM_MAX - SHD_DIM_MIN) / 990;
+        } else if (req > 0) {
             b = SHD_DIM_MIN;
         }
         b = b * max_brightness / 1000;
