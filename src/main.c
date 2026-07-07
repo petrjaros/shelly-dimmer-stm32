@@ -116,14 +116,13 @@ static hw_types hw_version                  = dimmer2;
 // brightness is computed in the idle loop (main) and read by the switching
 // ISRs (on_trigger, tim1_cc_isr), so it must be volatile.
 static volatile uint16_t brightness         = 0;
-static volatile uint16_t brightness_req    = 0; // set by USART ISR, read by idle loop
+static volatile uint16_t brightness_req     = 0; // set by USART ISR, read by idle loop
 // Computed in the idle loop and read by the zero-cross ISR (on_trigger), which
 // composes the OC compare values from it. Volatile: it crosses the idle-loop /
 // ISR boundary. Carries brightness scaled to the measured mains period.
-static volatile uint32_t brightness_adj    = 0;
+static volatile uint32_t brightness_adj     = 0;
 
 static volatile bool leading_edge           = false; // set by USART ISR, read by idle loop + ZC ISR
-static uint32_t low_brightness_threshold    = 0; // parsed from settings; unused since the base-offset removal
 
 // Measured mains half-cycle (ticks) = line_freq/60, computed in the idle loop
 // and read by the zero-cross ISR to anchor the 2nd half-cycle at n_half. The
@@ -263,9 +262,9 @@ static void packet_process(uint8_t *buf)
         case SHD_SETTINGS_CMD:
             {
                 leading_edge = 2 - buf[pos + 2];
-                // warmup_brightness, scaled to 1 us timer ticks (x10 vs the
-                // old 10 us ticks) so it stays in the same units as t_dim.
-                low_brightness_threshold = (buf[pos + 7] << 8 | buf[pos + 6]) * 10;
+                // The warmup_brightness setting (bytes pos+6/pos+7) is
+                // ignored: the conduction window always starts at the zero
+                // crossing, so there is no low-brightness turn-on delay.
             }
             break;
         default:

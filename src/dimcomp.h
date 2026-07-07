@@ -25,7 +25,7 @@
  *     dimcomp_init(&dc, 1000);              // ticks/half-cycle
  *
  *     // When user changes brightness (off the ISR — uses sin/cos):
- *     dimcomp_set_brightness(&dc, 100);
+ *     dimcomp_set_brightness(&dc, 100, 0);  // t_dim, window-start offset
  *
  *     // On every rising-edge ZC:
  *     uint16_t t1 = dimcomp_on_zc(&dc, now_ticks);   // first half-cycle
@@ -53,15 +53,13 @@ extern "C" {
 typedef struct {
     /* --- configuration (set by init) --- */
     uint16_t n_half;          /* nominal timer ticks per mains half-cycle  */
-    int32_t  scale_sin;       /* Q15-per-tick: sin_q15 = -(V_n+V_{n-1})*scale_sin */
-    int32_t  scale_cos;       /* Q15-per-tick: cos_q15 = -(V_n-V_{n-1})*scale_cos */
-    int16_t  rot_cos_q15;     /* cos(omega2*N mod 2pi), Q15. Per-cycle phasor */
-    int16_t  rot_sin_q15;     /* sin(omega2*N mod 2pi), Q15. drift of theta. */
+    int32_t  scale_sin;       /* Q15-per-tick: sin_q15 = +(U_n-U_{n-1})*scale_sin */
+    int32_t  scale_cos;       /* Q15-per-tick: cos_q15 = -(U_n+U_{n-1})*scale_cos */
+    int16_t  rot_cos_q15;     /* cos/sin(2*K_RATIO*pi mod 2pi), Q15:       */
+    int16_t  rot_sin_q15;     /*   per-FULL-cycle phasor rotation of theta */
 
     /* --- recomputed on brightness change --- */
     uint16_t t_dim_nominal;   /* what the user asked for                   */
-    uint16_t start_offset;    /* window-start offset W baked into sc_*:    */
-                              /* windows begin W ticks after their crossing */
     int32_t  sc_sin;          /* FIRST  half-cycle Δt coefficients         */
     int32_t  sc_cos;          /*   Δt = (sc_sin*sin + sc_cos*cos) >> 15    */
     int32_t  sc_sin2;         /* SECOND half-cycle Δt coefficients         */
@@ -75,11 +73,10 @@ typedef struct {
 
     /* --- runtime state --- */
     uint32_t t_prev_zc;       /* last zero-crossing timestamp (free-run)   */
-    int32_t  t_avg_q8;        /* running mean half-period, Q8 ticks        */
-    int32_t  v_prev;          /* previous V_n                              */
+    int32_t  t_avg_q8;        /* running mean FULL-cycle period, Q8 ticks  */
+    int32_t  v_prev;          /* previous U_n                              */
     int16_t  sin_th_q15;      /* smoothed sin(theta_n), Q15                */
     int16_t  cos_th_q15;      /* smoothed cos(theta_n), Q15                */
-    uint8_t  parity;          /* toggles every ZC                          */
     uint8_t  warmup;          /* cycles remaining before correction kicks in */
     uint8_t  smoothing_seeded;/* 0 until phasor EMA has been initialized   */
     uint8_t  signal_active;   /* 1 = signal detected, correction enabled.  */

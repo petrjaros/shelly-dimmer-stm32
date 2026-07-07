@@ -3,19 +3,13 @@
         {
             "name": "Linux",
             "includePath": [
-                "${workspaceFolder}/**",
-                "/usr/lib/gcc/x86_64-linux-gnu/7/include",
-                "/usr/local/include",
-                "/usr/lib/gcc/x86_64-linux-gnu/7/include-fixed",
-                "/usr/include/x86_64-linux-gnu",
-                "/usr/include"
+                "${workspaceFolder}/**"
             ],
             "defines": [
                 "STM32F0",
-                "__ARM_ARCH_6M__",
-                "__CC_ARM"
+                "__ARM_ARCH_6M__"
             ],
-            "compilerPath": "/usr/bin/gcc",
+            "compilerPath": "/usr/share/gcc-arm-none-eabi-9-2020-q2-update/bin/arm-none-eabi-gcc",
             "cStandard": "c99",
             "cppStandard": "c++14",
             "intelliSenseMode": "gcc-arm"

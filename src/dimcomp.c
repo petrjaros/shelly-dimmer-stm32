@@ -9,8 +9,8 @@
  *
  * The host fires the dimmer once per FULL mains cycle (on the rising-edge
  * ZC) and synthesises the mid-cycle event from a timer compare. We see one
- * measurement T_full per call (~2*n_half ticks). Same brightness_adj/Δt is
- * applied to both half-cycles within the upcoming full cycle.
+ * measurement T_full per call (~2*n_half ticks) and return a separate
+ * corrected off-time for each of the two upcoming half-cycles.
  *
  * Model:
  *   f1(x) = A·sin(π·x/N),  f2(x) = B·sin(K_RATIO·π·x/N + π·a/8)
@@ -20,18 +20,17 @@
  * where Θ_n = θ_{2n}, K = 2·C·sin(0.3332π), per-full-cycle phase advance
  *   Θ_{n+1} − Θ_n = 0.6664π (mod 2π).
  *
- * Phase recovery from U_n and U_{n−1}:
+ * Phase recovery from U_n and U_{n−1} (U = T_full − running mean):
  *   cos(Θ_n) = −(U_n + U_{n−1}) / (2K·cos(0.3332π))
  *   sin(Θ_n) = +(U_n − U_{n−1}) / (2K·sin(0.3332π))
  *
- * Δt for the upcoming cycle (sum of two half-cycle contributions, common Δt):
- *   Δt = (B/A)·N/sin²(πτ) · [P̃_eff·cos(Θ_M + π/6) − Q̃·sin(Θ_M + π/6)]
- *   P̃_eff = P̃ − sin²(πτ)/(2π)   (same as half-cycle)
- *   P̃, Q̃ are the standard cross-term shape functions.
- *
- * Since (U_n,U_{n−1}) yields Θ_{M−1} but we need Θ_M, the stored
- * coefficients absorb a rotation by γ = 2.5·(K_RATIO·π mod 2π) so the hot
- * path multiplies by cos(Θ_{M−1}), sin(Θ_{M−1}) as-is.
+ * Each half-cycle's Δt is a linear mix of that phasor,
+ *   Δt = sc_cos·cos(Θ) + sc_sin·sin(Θ),
+ * with coefficients precomputed in dimcomp_set_brightness (see there for
+ * the energy-balance derivation). Since (U_n,U_{n−1}) yields the phasor one
+ * cycle in the past, the stored coefficients also absorb the rotation that
+ * advances it to each upcoming crossing, so the hot path stays a plain
+ * multiply-accumulate.
  */
 
 #define K_RATIO     4.3332f
@@ -61,18 +60,22 @@
 
 /* Fractional bits of the stored sc_* coefficients. The hot-path mix
  *   sc * phasor(Q15)  must fit in int32, so the largest representable
- * correction is 2^31 >> (15+SC_SHIFT) ticks. SC_SHIFT=8 capped |Δt| at
- * 256 ticks: near-full brightness (small sin² at the window end => big
- * mul) needs ~270, and the mix then WRAPS, flipping the correction sign
- * on the worst-phase cycles - seen as a +1% energy spike every 3rd cycle.
- * SC_SHIFT=2 keeps quarter-tick coefficient resolution (quantisation
- * ~0.1 tick on typical Δt, invisible) and allows |Δt| up to 16384. */
+ * correction is 2^31 >> (15+SC_SHIFT) ticks. Don't raise this: SC_SHIFT=8
+ * caps |Δt| at 256 ticks, but near-full brightness (small sin² at the
+ * window end => big mul) needs ~270, and the mix then WRAPS, flipping the
+ * correction sign on the worst-phase cycles - seen as a +1% energy spike
+ * every 3rd cycle. SC_SHIFT=2 keeps quarter-tick coefficient resolution
+ * (quantisation ~0.1 tick on typical Δt, invisible) and allows |Δt| up to
+ * 16384. */
 #define SC_SHIFT         2
+
+/* Round float to nearest int32. */
+#define ROUND_I32(x) ((int32_t)((x) >= 0 ? (x) + 0.5f : (x) - 0.5f))
 
 void dimcomp_init(dimcomp_t *d, uint16_t n_half_ticks)
 {
     d->n_half = n_half_ticks;
-    /* T_avg now tracks the FULL-cycle period, ~ 2·n_half_ticks. */
+    /* T_avg tracks the FULL-cycle period, ~ 2·n_half_ticks. */
     d->t_avg_q8 = (int32_t)((uint32_t)n_half_ticks << 9);  /* 2*N << 8 */
 
     float n   = (float)n_half_ticks;
@@ -102,29 +105,29 @@ void dimcomp_init(dimcomp_t *d, uint16_t n_half_ticks)
     float C    = (float)n_half_ticks * B_OVER_A / pi;
     float base = 2.0f * C * cosf(0.5f * ha);          /* peak |oc3_offset| */
     float phs  = 2.5f * ha;
-    d->oc3_sin_coef = (int32_t)(base * cosf(phs) * 256.0f + (base * cosf(phs) >= 0 ? 0.5f : -0.5f));
-    d->oc3_cos_coef = (int32_t)(base * sinf(phs) * 256.0f + (base * sinf(phs) >= 0 ? 0.5f : -0.5f));
+    d->oc3_sin_coef = ROUND_I32(base * cosf(phs) * 256.0f);
+    d->oc3_cos_coef = ROUND_I32(base * sinf(phs) * 256.0f);
 
     d->t_prev_zc        = 0;
     d->v_prev           = 0;
     d->sin_th_q15       = 0;
     d->cos_th_q15       = 0;
-    d->parity           = 0;  /* unused in full-cycle */
     d->warmup           = WARMUP_CYCLES;
     d->smoothing_seeded = 0;
     d->signal_active    = 0;
     d->oc3_offset       = 0;
 
     d->t_dim_nominal = 0;
-    d->start_offset  = 0;
+    d->t_dim_second  = 0;
     d->sc_sin        = 0;
     d->sc_cos        = 0;
+    d->sc_sin2       = 0;
+    d->sc_cos2       = 0;
 }
 
 void dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal,
                             uint16_t win_start_offset)
 {
-    d->start_offset = win_start_offset;
     if (t_dim_nominal == 0 || t_dim_nominal >= d->n_half) {
         d->sc_sin = 0;
         d->sc_cos = 0;
@@ -168,8 +171,8 @@ void dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal,
      *                un-advanced crossing phase. The (1 - ...) factor is
      *                the f1²(start)/f1²(end) leak of a start shift.
      *
-     * The old code folded both into P̃_eff = P̃ - sin²(πτ)/(2π), which is
-     * only valid for W = 0. For M odd both terms flip sign.
+     * (For W = 0 the two would fold into the single shape function
+     * P̃_eff = P̃ - sin²(πτ)/(2π).) For M odd both terms flip sign.
      *
      * Coefficients are stored ×SC_SCALE (Q-format with extra fractional
      * bits) so small Δt values aren't lost to int truncation. The hot path
@@ -207,16 +210,14 @@ void dimcomp_set_brightness(dimcomp_t *d, uint16_t t_dim_nominal,
      * Boundary contribution C·sin(θ+r) is the (a,b) = (0, C) case. */
     /* Round-to-nearest at the Q-scale. */
     #define SC_SCALE ((float)(1 << SC_SHIFT))
-    #define ROUND(x) ((int32_t)((x) >= 0 ? (x) + 0.5f : (x) - 0.5f))
-    int32_t new_cos1 = ROUND(SC_SCALE * ( cr_cos * cosf(r1x) + cr_sin * sinf(r1x)
-                                         + cb * sinf(r1b)));
-    int32_t new_sin1 = ROUND(SC_SCALE * ( cr_sin * cosf(r1x) - cr_cos * sinf(r1x)
-                                         + cb * cosf(r1b)));
-    int32_t new_cos2 = ROUND(SC_SCALE * (-cr_cos * cosf(r2x) - cr_sin * sinf(r2x)
-                                         - cb * sinf(r2b)));
-    int32_t new_sin2 = ROUND(SC_SCALE * (-cr_sin * cosf(r2x) + cr_cos * sinf(r2x)
-                                         - cb * cosf(r2b)));
-    #undef ROUND
+    int32_t new_cos1 = ROUND_I32(SC_SCALE * ( cr_cos * cosf(r1x) + cr_sin * sinf(r1x)
+                                             + cb * sinf(r1b)));
+    int32_t new_sin1 = ROUND_I32(SC_SCALE * ( cr_sin * cosf(r1x) - cr_cos * sinf(r1x)
+                                             + cb * cosf(r1b)));
+    int32_t new_cos2 = ROUND_I32(SC_SCALE * (-cr_cos * cosf(r2x) - cr_sin * sinf(r2x)
+                                             - cb * sinf(r2b)));
+    int32_t new_sin2 = ROUND_I32(SC_SCALE * (-cr_sin * cosf(r2x) + cr_cos * sinf(r2x)
+                                             - cb * cosf(r2b)));
     #undef SC_SCALE
 
     d->sc_sin  = new_sin1;
@@ -239,15 +240,15 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
     int32_t T_n = (int32_t)(timestamp_ticks - d->t_prev_zc);
     d->t_prev_zc = timestamp_ticks;
 
-    /* 2. Sanity gate (now centred on ~2N). */
+    /* 2. Sanity gate, centred on ~2N. */
     int32_t T_avg = d->t_avg_q8 >> 8;
     if (T_n < (T_avg >> 1) || T_n > T_avg + (T_avg >> 1)) {
         /* Gap or glitch in the call stream — e.g. the host stopped calling
-         * between signal bursts. v_prev, u_recent and the phasor all
-         * describe the signal from before the gap, so fall back to fresh
-         * detection: correcting from the stale phase blinked the light at
-         * the start of every burst. warmup=1 spends one call re-seeding
-         * v_prev before the phase recovery is trusted again. */
+         * between signal bursts. v_prev and the phasor describe the signal
+         * from before the gap, and correcting from that stale phase blinks
+         * the light at the start of every burst, so fall back to fresh
+         * detection. warmup=1 spends one call re-seeding v_prev before the
+         * phase recovery is trusted again. */
         d->warmup           = 1;
         d->signal_active    = 0;
         d->smoothing_seeded = 0;
@@ -256,16 +257,15 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
         return d->t_dim_nominal;
     }
 
-    /* 3. U_n = T_n − T_avg, using T_avg BEFORE the EMA update so U_n isn't
-     *    biased by α·T_n (which would shrink the recovered amplitude by
-     *    1-α = 1-1/32 ≈ 3% under the previous "update first, subtract after"
-     *    ordering). */
+    /* 3. U_n = T_n − T_avg, using T_avg from BEFORE the EMA update:
+     *    updating first would fold α·T_n into the mean and shrink the
+     *    recovered amplitude by 1-α = 1-1/32 ≈ 3%. */
     int32_t U_n = T_n - T_avg;
 
     /* Update the running mean. */
     d->t_avg_q8 += ((T_n << 8) - d->t_avg_q8) >> ALPHA_T_LOG2;
 
-    /* Warmup. */
+    /* 4. Warmup. */
     if (d->warmup) {
         d->warmup--;
         d->v_prev = U_n;
@@ -284,16 +284,16 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
     int16_t cos_new = clamp_q15(-sum_u  * d->scale_cos);
     int16_t sin_new = clamp_q15( diff_u * d->scale_sin);
 
-    /* 4c. Pair-magnitude hysteretic signal-presence detector.
-     *     mag² = sin²+cos² ≈ (amplitude/K)² in Q30, phase-INDEPENDENT for a
-     *     steady tone. The previous max-of-3 |U_n| detector sampled cos Θ,
-     *     which can sit near a beat zero for the first 1-2 burst cycles, so
-     *     detection came up to 2 full cycles late — the visible flash at HDO
-     *     burst onset. A pair straddling the onset only shrinks mag² (partial
-     *     sample), and the unnormalized phasor then also shrinks the applied
-     *     correction by the same factor, so engaging early degrades
-     *     gracefully. Release: two clean samples drop mag² below MAG2_OFF
-     *     within 2 cycles of burst end. */
+    /* 6. Pair-magnitude hysteretic signal-presence detector.
+     *    mag² = sin²+cos² ≈ (amplitude/K)² in Q30, phase-INDEPENDENT for a
+     *    steady tone. (Thresholding |U_n| alone would sample cos Θ, which
+     *    can sit near a beat zero for the first 1-2 burst cycles, delaying
+     *    detection by up to 2 full cycles — a visible flash at HDO burst
+     *    onset.) A pair straddling the onset only shrinks mag² (partial
+     *    sample), and the unnormalized phasor then also shrinks the applied
+     *    correction by the same factor, so engaging early degrades
+     *    gracefully. Release: two clean samples drop mag² below MAG2_OFF
+     *    within 2 cycles of burst end. */
     uint32_t mag2 = (uint32_t)((int32_t)cos_new * cos_new)
                   + (uint32_t)((int32_t)sin_new * sin_new);
     if (d->signal_active) {
@@ -311,7 +311,7 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
         return d->t_dim_nominal;
     }
 
-    /* 6. Rotation-aware smoothing (rotation by 2·K_RATIO·π per cycle).
+    /* 7. Rotation-aware smoothing (rotation by 2·K_RATIO·π per cycle).
      *    With ALPHA_TH_LOG2=0 this degenerates to "use latest sample". */
     if (!d->smoothing_seeded) {
         d->sin_th_q15      = sin_new;
@@ -326,7 +326,7 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
         d->cos_th_q15 = (int16_t)(cos_pred + (((int32_t)cos_new - cos_pred) >> ALPHA_TH_LOG2));
     }
 
-    /* 7. Compute Δt for BOTH upcoming half-cycles. The coefficients carry the
+    /* 8. Compute Δt for BOTH upcoming half-cycles. The coefficients carry the
      *    rotation that maps the estimated phasor at Θ_{n-1} forward to the
      *    correct θ_M (2α for the first half, 3α for the second) plus the
      *    (-1)^M sign for the second.
@@ -342,9 +342,9 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
     int32_t dt1 = (mix1 + (1 << (14 + SC_SHIFT))) >> (15 + SC_SHIFT);
     int32_t dt2 = (mix2 + (1 << (14 + SC_SHIFT))) >> (15 + SC_SHIFT);
 
-    /* 7b. OC3 offset: shift the mid-cycle event from N to N+(δ₂−δ₁) so the
-     *     dimmer fires at the predicted ACTUAL second-half ZC, not just N
-     *     ticks after the first ZC. Same Q8 coefficient/Q15 phasor scheme. */
+    /* 9. OC3 offset: shift the mid-cycle event from N to N+(δ₂−δ₁) so the
+     *    dimmer fires at the predicted ACTUAL second-half ZC, not just N
+     *    ticks after the first ZC. Same Q8 coefficient/Q15 phasor scheme. */
     int32_t mix3 = d->oc3_sin_coef * (int32_t)d->sin_th_q15
                  + d->oc3_cos_coef * (int32_t)d->cos_th_q15;
     int32_t oc3 = (mix3 + (1 << 22)) >> 23;
@@ -352,7 +352,7 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
     if (oc3 < -300) oc3 = -300;
     d->oc3_offset = (int16_t)oc3;
 
-    /* 8. Clamp and apply (independently for each half-cycle). */
+    /* 10. Clamp and apply (independently for each half-cycle). */
     int32_t lim = ((int32_t)d->t_dim_nominal * DT_LIMIT_NUM) / DT_LIMIT_DEN;
     if (dt1 >  lim) dt1 =  lim;
     if (dt1 < -lim) dt1 = -lim;
