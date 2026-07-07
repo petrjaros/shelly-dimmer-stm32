@@ -42,13 +42,20 @@
 #define ALPHA_TH_LOG2    0   /* rotation-aware EMA on (sin,cos)(Θ); see hdr */
 #endif
 #ifndef VMAG_ON_NUM
-#define VMAG_ON_NUM      5   /* on  threshold = NUM/10 · K                  */
+#define VMAG_ON_NUM      3   /* on  threshold = NUM/10 of full tone amplitude */
 #endif
 #ifndef VMAG_OFF_NUM
-#define VMAG_OFF_NUM     3   /* off threshold = NUM/10 · K  (hysteresis)    */
+#define VMAG_OFF_NUM     2   /* off threshold = NUM/10 (hysteresis)           */
 #endif
 #define DT_LIMIT_NUM     3
 #define DT_LIMIT_DEN     8
+
+/* Pair-magnitude detection thresholds: (fraction of full tone amplitude)²
+ * in the Q30 units of mag² = sin²+cos² of the recovered phasor. */
+#define MAG2_ON  ((uint32_t)((32768.0f * VMAG_ON_NUM  / 10) * \
+                             (32768.0f * VMAG_ON_NUM  / 10)))
+#define MAG2_OFF ((uint32_t)((32768.0f * VMAG_OFF_NUM / 10) * \
+                             (32768.0f * VMAG_OFF_NUM / 10)))
 #define S2_FLOOR         0.02f
 #define WARMUP_CYCLES    4
 
@@ -88,10 +95,6 @@ void dimcomp_init(dimcomp_t *d, uint16_t n_half_ticks)
     d->rot_cos_q15 = (int16_t)(cosf(rot) * 32767.0f);
     d->rot_sin_q15 = (int16_t)(sinf(rot) * 32767.0f);
 
-    /* Detection thresholds scaled to peak |U_n| = K. */
-    d->v_thresh_on  = (int16_t)(K * (float)VMAG_ON_NUM  / 10.0f + 0.5f);
-    d->v_thresh_off = (int16_t)(K * (float)VMAG_OFF_NUM / 10.0f + 0.5f);
-
     /* OC3 offset coefficients.
      * oc3 = δ_second − δ_first = 2·C·cos(α/2)·sin(Θ_n + 2.5α)
      *     = base·[cos(2.5α)·sinΘ + sin(2.5α)·cosΘ]
@@ -110,10 +113,6 @@ void dimcomp_init(dimcomp_t *d, uint16_t n_half_ticks)
     d->warmup           = WARMUP_CYCLES;
     d->smoothing_seeded = 0;
     d->signal_active    = 0;
-    d->u_recent[0]      = 0;
-    d->u_recent[1]      = 0;
-    d->u_recent[2]      = 0;
-    d->u_idx            = 0;
     d->oc3_offset       = 0;
 
     d->t_dim_nominal = 0;
@@ -252,9 +251,6 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
         d->warmup           = 1;
         d->signal_active    = 0;
         d->smoothing_seeded = 0;
-        d->u_recent[0]      = 0;
-        d->u_recent[1]      = 0;
-        d->u_recent[2]      = 0;
         d->t_dim_second = d->t_dim_nominal;
         d->oc3_offset = 0;
         return d->t_dim_nominal;
@@ -269,16 +265,6 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
     /* Update the running mean. */
     d->t_avg_q8 += ((T_n << 8) - d->t_avg_q8) >> ALPHA_T_LOG2;
 
-    /* 4b. Update the 3-cycle |U_n| ring. The signal is a cosine sampled at
-     *     120° per full mains cycle, so any 3 consecutive |U_n| values must
-     *     include at least one ≥ K·√3/2 ≈ 0.866·K regardless of starting
-     *     phase. A simple max-of-3 with hysteresis is therefore guaranteed
-     *     to catch any real burst within 1-3 cycles AND release within 3
-     *     cycles of burst end — no decay tuning needed. */
-    int32_t u_abs = U_n < 0 ? -U_n : U_n;
-    d->u_recent[d->u_idx] = (int16_t)(u_abs > 32767 ? 32767 : u_abs);
-    d->u_idx = (uint8_t)((d->u_idx + 1) % 3);
-
     /* Warmup. */
     if (d->warmup) {
         d->warmup--;
@@ -288,33 +274,42 @@ uint16_t dimcomp_on_zc(dimcomp_t *d, uint32_t timestamp_ticks)
         return d->t_dim_nominal;
     }
 
-    /* 4c. Max-of-3 hysteretic signal-presence detector. */
-    int16_t u_max = d->u_recent[0];
-    if (d->u_recent[1] > u_max) u_max = d->u_recent[1];
-    if (d->u_recent[2] > u_max) u_max = d->u_recent[2];
-    if (d->signal_active) {
-        if (u_max < d->v_thresh_off) d->signal_active = 0;
-    } else {
-        if (u_max > d->v_thresh_on) {
-            d->signal_active    = 1;
-            d->smoothing_seeded = 0;
-        }
-    }
-
-    if (!d->signal_active) {
-        d->v_prev = U_n;
-        d->t_dim_second = d->t_dim_nominal;
-        d->oc3_offset = 0;
-        return d->t_dim_nominal;
-    }
-
-    /* 5. Recover cos(Θ_{M-1}), sin(Θ_{M-1}) in Q15. */
+    /* 5. Recover cos(Θ_{M-1}), sin(Θ_{M-1}) in Q15. Runs before detection:
+     *    two consecutive samples of the 120°-per-cycle beat cosine determine
+     *    amplitude AND phase, and detection keys on the amplitude. */
     int32_t sum_u  = U_n + d->v_prev;
     int32_t diff_u = U_n - d->v_prev;
     d->v_prev = U_n;
 
     int16_t cos_new = clamp_q15(-sum_u  * d->scale_cos);
     int16_t sin_new = clamp_q15( diff_u * d->scale_sin);
+
+    /* 4c. Pair-magnitude hysteretic signal-presence detector.
+     *     mag² = sin²+cos² ≈ (amplitude/K)² in Q30, phase-INDEPENDENT for a
+     *     steady tone. The previous max-of-3 |U_n| detector sampled cos Θ,
+     *     which can sit near a beat zero for the first 1-2 burst cycles, so
+     *     detection came up to 2 full cycles late — the visible flash at HDO
+     *     burst onset. A pair straddling the onset only shrinks mag² (partial
+     *     sample), and the unnormalized phasor then also shrinks the applied
+     *     correction by the same factor, so engaging early degrades
+     *     gracefully. Release: two clean samples drop mag² below MAG2_OFF
+     *     within 2 cycles of burst end. */
+    uint32_t mag2 = (uint32_t)((int32_t)cos_new * cos_new)
+                  + (uint32_t)((int32_t)sin_new * sin_new);
+    if (d->signal_active) {
+        if (mag2 < MAG2_OFF) d->signal_active = 0;
+    } else {
+        if (mag2 > MAG2_ON) {
+            d->signal_active    = 1;
+            d->smoothing_seeded = 0;
+        }
+    }
+
+    if (!d->signal_active) {
+        d->t_dim_second = d->t_dim_nominal;
+        d->oc3_offset = 0;
+        return d->t_dim_nominal;
+    }
 
     /* 6. Rotation-aware smoothing (rotation by 2·K_RATIO·π per cycle).
      *    With ALPHA_TH_LOG2=0 this degenerates to "use latest sample". */

@@ -57,8 +57,6 @@ typedef struct {
     int32_t  scale_cos;       /* Q15-per-tick: cos_q15 = -(V_n-V_{n-1})*scale_cos */
     int16_t  rot_cos_q15;     /* cos(omega2*N mod 2pi), Q15. Per-cycle phasor */
     int16_t  rot_sin_q15;     /* sin(omega2*N mod 2pi), Q15. drift of theta. */
-    int16_t  v_thresh_on;     /* signal-on  threshold on |V_n| EMA (ticks)   */
-    int16_t  v_thresh_off;    /* signal-off threshold on |V_n| EMA (ticks)   */
 
     /* --- recomputed on brightness change --- */
     uint16_t t_dim_nominal;   /* what the user asked for                   */
@@ -84,9 +82,10 @@ typedef struct {
     uint8_t  parity;          /* toggles every ZC                          */
     uint8_t  warmup;          /* cycles remaining before correction kicks in */
     uint8_t  smoothing_seeded;/* 0 until phasor EMA has been initialized   */
-    uint8_t  signal_active;   /* 1 = signal detected, correction enabled   */
-    int16_t  u_recent[3];     /* ring buffer of last 3 |U_n| values        */
-    uint8_t  u_idx;           /* write position in u_recent                 */
+    uint8_t  signal_active;   /* 1 = signal detected, correction enabled.  */
+                              /* Hysteresis on the recovered phasor's      */
+                              /* magnitude (pair of U_n samples => tone    */
+                              /* amplitude, phase-independent).            */
 } dimcomp_t;
 
 /* Initialize. n_half_ticks = nominal timer ticks per mains half-cycle. */
